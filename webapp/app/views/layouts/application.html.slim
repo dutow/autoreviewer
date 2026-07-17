@@ -1,0 +1,28 @@
+doctype html
+html
+  head
+    title Reviews
+    meta name="viewport" content="width=device-width,initial-scale=1"
+    = csrf_meta_tags
+    javascript:
+      (function() {
+        var t = null;
+        try { t = localStorage.getItem("theme"); } catch (e) {}
+        if (t !== "light" && t !== "dark")
+          t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.dataset.theme = t;
+      })();
+    = stylesheet_link_tag :app
+    = javascript_include_tag "app", defer: true
+  body
+    header.topbar
+      = link_to "Reviews", root_path, class: "brand"
+      = form_with url: search_path, method: :get, class: "searchbox" do |f|
+        = f.text_field :q, value: params[:q], placeholder: "Search findings…", aria: { label: "Search findings" }
+      .right
+        button#theme-toggle type="button" aria-label="Toggle theme"
+          | 🌙
+        - if current_email
+          span.user = current_email
+          = button_to "Log out", logout_path, method: :delete
+    main = yield

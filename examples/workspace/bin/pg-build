@@ -1,0 +1,277 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'yaml'
+require 'fileutils'
+require 'open3'
+require 'time'
+
+$stdout.sync = true
+
+class PgBuild
+  def initialize(argv)
+    require 'optparse'
+    project_yaml = nil
+    parser = OptionParser.new do |o|
+      o.on('--project PATH', 'Path to project.yaml') { |v| project_yaml = v }
+    end
+    parser.order!(argv)
+
+    if argv.size < 2
+      puts "Usage: pg-build [--project <project.yaml>] <source> <config_name>"
+      puts ""
+      puts "Arguments:"
+      puts "  source       'master' or review topic (e.g. t52051)"
+      puts "  config_name  Config file name without .yaml (e.g. debug-meson)"
+      exit 1
+    end
+
+    @source = argv[0]
+    @config_name = argv[1]
+
+    # Project dir: from --project's directory, else this script's own directory.
+    @project_dir = project_yaml ? File.dirname(File.expand_path(project_yaml)) : __dir__
+
+    @source_dir =
+      if @source == 'master'
+        File.join(@project_dir, 'master')
+      elsif File.directory?(File.join(@project_dir, 'review', @source))
+        File.join(@project_dir, 'review', @source)
+      else
+        ensure_branch_worktree(@source)
+      end
+
+    unless File.directory?(@source_dir)
+      puts "ERROR: Source directory not found: #{@source_dir}"
+      exit 1
+    end
+
+    config_path = File.join(@project_dir, 'configs', "#{@config_name}.yaml")
+    unless File.exist?(config_path)
+      puts "ERROR: Config file not found: #{config_path}"
+      exit 1
+    end
+
+    @config = YAML.safe_load_file(config_path)
+
+    unless %w[meson autoconf].include?(@config['build_system'])
+      puts "ERROR: build_system must be 'meson' or 'autoconf', got: #{@config['build_system'].inspect}"
+      exit 1
+    end
+
+    @build_system = @config['build_system']
+    @run_tests = @config.fetch('run_tests', false)
+    @install = @config.fetch('install', true)
+    @build_args = @config.fetch('build_args', [])
+    @test_args = @config.fetch('test_args', [])
+    @test_command = @config.fetch('test_command', 'check')
+    @jobs = @config.fetch('jobs', nil) || detect_nproc
+
+    @build_base = File.join(@project_dir, 'builds', @source, @config_name)
+    @build_dir = File.join(@build_base, 'build')
+    @install_dir = File.join(@build_base, 'install')
+    @log_dir = File.join(@build_base, 'logs')
+
+    @status = {}
+  end
+
+  def run
+    started_at = Time.now
+
+    FileUtils.rm_rf(@build_base)
+    FileUtils.mkdir_p(@build_dir)
+    FileUtils.mkdir_p(@install_dir)
+    FileUtils.mkdir_p(@log_dir)
+
+    puts "=== PostgreSQL Build ==="
+    puts "Source:       #{@source} (#{@source_dir})"
+    puts "Config:       #{@config_name}"
+    puts "Build system: #{@build_system}"
+    puts "Build dir:    #{@build_dir}"
+    puts ""
+
+    setup_ok = send("#{@build_system}_setup")
+    @status['setup'] = setup_ok ? 'success' : 'failed'
+
+    if setup_ok
+      build_ok = send("#{@build_system}_build")
+      @status['build'] = build_ok ? 'success' : 'failed'
+    else
+      @status['build'] = 'skipped'
+      build_ok = false
+    end
+
+    if build_ok && @install
+      install_ok = send("#{@build_system}_install")
+      @status['install'] = install_ok ? 'success' : 'failed'
+    else
+      @status['install'] = 'skipped'
+    end
+
+    if build_ok && @run_tests
+      test_ok = send("#{@build_system}_test")
+      @status['test'] = test_ok ? 'success' : 'failed'
+    else
+      @status['test'] = 'skipped'
+    end
+
+    finished_at = Time.now
+
+    status_data = {
+      'source' => @source,
+      'config' => @config_name,
+      'started_at' => started_at.iso8601,
+      'setup' => @status['setup'],
+      'build' => @status['build'],
+      'install' => @status['install'],
+      'test' => @status['test'],
+      'finished_at' => finished_at.iso8601
+    }
+    File.write(File.join(@build_base, 'status.yaml'), YAML.dump(status_data))
+
+    print_summary
+  end
+
+  private
+
+  def run_step(name, cmd, opts = {})
+    cwd = opts[:cwd] || @build_dir
+    log_path = File.join(@log_dir, "#{name}.log")
+
+    print "#{name}... "
+
+    log_file = File.open(log_path, 'w')
+    log_file.sync = true
+    success = false
+
+    begin
+      Open3.popen2e(*cmd, chdir: cwd) do |_stdin, stdout_err, wait_thr|
+        stdout_err.each_line do |line|
+          log_file.write(line)
+        end
+        success = wait_thr.value.success?
+      end
+    ensure
+      log_file.close
+    end
+
+    if success
+      puts "OK"
+    else
+      puts "FAILED (see logs/#{name}.log)"
+    end
+
+    success
+  end
+
+  def detect_nproc
+    n = `nproc`.strip.to_i
+    n > 0 ? n : 4
+  rescue Errno::ENOENT
+    4
+  end
+
+  def ensure_branch_worktree(branch)
+    master = File.join(@project_dir, 'master')
+    unless File.directory?(master)
+      puts "ERROR: master checkout not found: #{master}"
+      exit 1
+    end
+
+    wt = File.join(@project_dir, 'branches', branch)
+
+    # Refresh the branch ref in master. A fetch failure is non-fatal (offline
+    # rebuilds are valid) but warn, since the build may then be stale.
+    unless system('git', '-C', master, 'fetch', 'origin', branch)
+      puts "WARNING: could not fetch origin/#{branch}; building from local ref"
+    end
+
+    # Use a DETACHED worktree at the remote-tracking ref. A non-detached
+    # worktree would claim the branch, which fails when master/ itself already
+    # has that branch checked out (common: base_branch == master/'s default).
+    ref = "origin/#{branch}"
+    if File.directory?(wt)
+      # Existing worktree is treated as disposable: force it to the branch tip.
+      unless system('git', '-C', wt, 'checkout', '--detach', ref) &&
+             system('git', '-C', wt, 'reset', '--hard', ref)
+        puts "ERROR: could not update worktree for branch '#{branch}' at #{wt}"
+        exit 1
+      end
+    else
+      FileUtils.mkdir_p(File.dirname(wt))
+      unless system('git', '-C', master, 'worktree', 'add', '--detach', wt, ref)
+        puts "ERROR: could not create worktree for branch '#{branch}' (is it fetched in master/?)"
+        exit 1
+      end
+    end
+    wt
+  end
+
+  def meson_setup
+    cmd = ['meson', 'setup', @build_dir, @source_dir, "--prefix=#{@install_dir}"] + @build_args
+    cmd << '--reconfigure' if File.exist?(File.join(@build_dir, 'build.ninja'))
+    run_step('setup', cmd, cwd: @project_dir)
+  end
+
+  def meson_build
+    cmd = ['meson', 'compile', '-C', @build_dir, '-j', @jobs.to_s]
+    run_step('build', cmd, cwd: @project_dir)
+  end
+
+  def meson_install
+    cmd = ['meson', 'install', '-C', @build_dir]
+    run_step('install', cmd, cwd: @project_dir)
+  end
+
+  def meson_test
+    cmd = ['meson', 'test', '-C', @build_dir, '--print-errorlogs'] + @test_args
+    run_step('test', cmd, cwd: @project_dir)
+  end
+
+  def autoconf_setup
+    cmd = [File.join(@source_dir, 'configure'), "--prefix=#{@install_dir}"] + @build_args
+    run_step('setup', cmd)
+  end
+
+  def autoconf_build
+    cmd = ['make', 'world-bin', '-j', @jobs.to_s]
+    run_step('build', cmd)
+  end
+
+  def autoconf_install
+    cmd = ['make', 'install-world-bin']
+    run_step('install', cmd)
+  end
+
+  def autoconf_test
+    cmd = ['make', @test_command, '-j', @jobs.to_s]
+    run_step('test', cmd)
+  end
+
+  def print_summary
+    puts "=== Build Summary ==="
+    puts "Source:  #{@source}"
+    puts "Config:  #{@config_name}"
+
+    { 'Setup' => 'setup', 'Build' => 'build', 'Install' => 'install', 'Test' => 'test' }.each do |label, key|
+      status_text = case @status[key]
+      when 'success' then 'OK'
+      when 'failed' then "FAILED (see #{File.basename(@project_dir)}/builds/#{@source}/#{@config_name}/logs/#{key}.log)"
+      when 'skipped' then 'SKIPPED'
+      end
+      puts "#{(label + ':').ljust(9)} #{status_text}"
+    end
+  end
+end
+
+if __FILE__ == $0
+  begin
+    PgBuild.new(ARGV).run
+  rescue Interrupt
+    puts "\n\nInterrupted by user"
+    exit 130
+  rescue => e
+    puts "\nERROR: #{e.message}"
+    exit 1
+  end
+end

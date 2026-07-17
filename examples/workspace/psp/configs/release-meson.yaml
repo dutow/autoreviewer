@@ -1,0 +1,8 @@
+build_system: meson
+build_args:
+  - -Dcassert=false
+  - -Dtap_tests=disabled
+  - -Dbuildtype=release
+run_tests: false
+install: true
+jobs: null

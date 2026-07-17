@@ -1,0 +1,143 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# pg_tde extension build hook (meson only).
+# Usage: pg_tde-build --project <project.yaml> <source> <config_name>
+#   <source>      review topic (pr<N>) or 'master'
+#   <config_name> a file under pg_tde/configs/ pinning a PSP major
+#
+# Builds and tests pg_tde against a PSP install resolved by convention:
+#   psp/builds/<psp_branch>/<psp_config>/install
+# If that install is missing, it is built via bin/pg-build first.
+
+require 'yaml'
+require 'json'
+require 'optparse'
+require 'fileutils'
+require 'open3'
+require 'time'
+
+$stdout.sync = true
+
+project_yaml = nil
+OptionParser.new do |o|
+  o.on('--project PATH', 'Path to project.yaml') { |v| project_yaml = v }
+end.order!(ARGV)
+
+abort 'Usage: pg_tde-build --project <project.yaml> <source> <config_name>' if ARGV.size < 2
+source       = ARGV[0]
+config_name  = ARGV[1]
+
+project_yaml = File.expand_path(project_yaml) if project_yaml
+project_dir  = project_yaml ? File.dirname(project_yaml) : __dir__
+repo_root    = File.expand_path('..', project_dir)
+
+config_path = File.join(project_dir, 'configs', "#{config_name}.yaml")
+abort "ERROR: config not found: #{config_path}" unless File.exist?(config_path)
+cfg = YAML.safe_load_file(config_path)
+
+psp_branch = cfg['psp_branch'] or abort 'ERROR: config missing psp_branch'
+psp_config = cfg['psp_config'] or abort 'ERROR: config missing psp_config'
+extra_args = cfg['build_args'] || []
+
+source_dir =
+  if source == 'master'
+    File.join(project_dir, 'master')
+  else
+    File.join(project_dir, 'review', source)
+  end
+abort "ERROR: source dir not found: #{source_dir}" unless File.directory?(source_dir)
+
+# pg_tde vendors libkmip as a git submodule; meson setup fails without it.
+if File.exist?(File.join(source_dir, '.gitmodules'))
+  puts 'pg_tde-build: initializing git submodules...'
+  system('git', '-C', source_dir, 'submodule', 'update', '--init', '--recursive') ||
+    abort('ERROR: git submodule update failed')
+end
+
+psp_yaml    = File.join(repo_root, 'psp', 'project.yaml')
+psp_install = File.join(repo_root, 'psp', 'builds', psp_branch, psp_config, 'install')
+pg_config   = File.join(psp_install, 'bin', 'pg_config')
+
+unless File.executable?(pg_config)
+  puts "pg_tde-build: PSP install missing, building #{psp_branch}/#{psp_config}..."
+  pg_build = File.join(repo_root, 'bin', 'pg-build')
+  ok = system(pg_build, '--project', psp_yaml, psp_branch, psp_config)
+  abort 'ERROR: PSP auto-build failed' unless ok
+  abort "ERROR: pg_config still missing after build: #{pg_config}" unless File.executable?(pg_config)
+end
+
+build_base = File.join(project_dir, 'builds', source, config_name)
+build_dir  = File.join(build_base, 'build')
+log_dir    = File.join(build_base, 'logs')
+FileUtils.rm_rf(build_base)
+FileUtils.mkdir_p(build_dir)
+FileUtils.mkdir_p(log_dir)
+
+nproc = begin
+  n = `nproc`.strip.to_i
+  n.positive? ? n.to_s : '4'
+rescue Errno::ENOENT
+  '4'
+end
+
+status = {}
+started = Time.now
+
+run = lambda do |name, cmd|
+  log = File.join(log_dir, "#{name}.log")
+  print "#{name}... "
+  ok = false
+  File.open(log, 'w') do |f|
+    f.sync = true
+    Open3.popen2e(*cmd) do |_i, oe, wt|
+      oe.each_line { |l| f.write(l) }
+      ok = wt.value.success?
+    end
+  end
+  puts(ok ? 'OK' : "FAILED (see logs/#{name}.log)")
+  ok
+end
+
+setup_ok = run.call('setup',
+  ['meson', 'setup', build_dir, source_dir, "-Dpg_config=#{pg_config}", *extra_args])
+status['setup'] = setup_ok ? 'success' : 'failed'
+
+build_ok = false
+if setup_ok
+  build_ok = run.call('build', ['meson', 'compile', '-C', build_dir, '-j', nproc])
+  status['build'] = build_ok ? 'success' : 'failed'
+else
+  status['build'] = 'skipped'
+end
+
+if build_ok
+  status['install'] = run.call('install', ['meson', 'install', '-C', build_dir]) ? 'success' : 'failed'
+else
+  status['install'] = 'skipped'
+end
+
+if build_ok
+  status['test'] = run.call('test', ['meson', 'test', '-C', build_dir, '--print-errorlogs']) ? 'success' : 'failed'
+else
+  status['test'] = 'skipped'
+end
+
+File.write(File.join(build_base, 'status.yaml'), YAML.dump({
+  'source'      => source,
+  'config'      => config_name,
+  'psp_branch'  => psp_branch,
+  'psp_config'  => psp_config,
+  'psp_install' => psp_install,
+  'started_at'  => started.iso8601,
+  'setup'       => status['setup'],
+  'build'       => status['build'],
+  'install'     => status['install'],
+  'test'        => status['test'],
+  'finished_at' => Time.now.iso8601,
+}))
+
+puts "=== pg_tde Build Summary ==="
+puts "Source:  #{source}"
+puts "Config:  #{config_name} (PSP #{psp_branch})"
+%w[setup build install test].each { |k| puts "#{(k.capitalize + ':').ljust(9)} #{status[k]}" }

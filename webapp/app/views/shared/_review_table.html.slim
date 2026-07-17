@@ -1,0 +1,23 @@
+table.reviews
+  thead
+    tr
+      th Project
+      th Topic
+      th Version
+      th Title
+      th Reviewed
+      th Source
+  tbody
+    - reviews.each do |r|
+      tr
+        td = link_to r.project, project_path(r.project)
+        td = link_to r.topic, topic_path(r.project, r.topic)
+        td = link_to "v#{r.version}", version_path(r.project, r.topic, r.version)
+        td = r.title
+        td.date = r.reviewed_at&.strftime("%Y-%m-%d %H:%M")
+        td
+          - if (u = safe_url(r.source_url))
+            = link_to "source", u
+          - if (u = safe_url(r.hackorum_url))
+            '
+            = link_to "hackorum", u

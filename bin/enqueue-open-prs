@@ -1,0 +1,81 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# Bulk-enqueue every open PR of a GitHub-PR project.
+#
+# One-shot bootstrap helper: bin/review-poll deliberately baselines silently on
+# a project's first cycle (records head shas, enqueues nothing), so PRs that
+# were already open when a project is added are never picked up automatically.
+# Run this once after adding a project.
+#
+# Safe to run before or after the poller's first cycle: the poller's baseline
+# enqueues nothing either way, so there is no double-processing.
+#
+# Usage: enqueue-open-prs <project> [--dry-run]
+
+require 'json'
+require 'yaml'
+
+GH_PR_LIMIT  = 300
+base_dir     = File.expand_path('..', __dir__)
+workspace_dir = File.expand_path(ENV['WORKSPACE_DIR'] || File.join(base_dir, 'workspace'))
+projects_dir = workspace_dir
+
+args    = ARGV.dup
+dry_run = !args.delete('--dry-run').nil?
+project = args.shift
+
+abort 'Usage: enqueue-open-prs <project> [--dry-run]' if project.nil? || !args.empty?
+
+yaml = File.join(projects_dir, project, 'project.yaml')
+abort "ERROR: project.yaml not found: #{yaml}" unless File.exist?(yaml)
+
+cfg    = YAML.safe_load_file(yaml)
+source = cfg['source']
+abort "ERROR: #{project} has no 'source' (owner/repo); not a GitHub-PR project" unless source
+prefix = cfg['topic_prefix'] || 'pr'
+
+abort 'ERROR: gh is not authenticated (run `gh auth login` or set GH_TOKEN)' \
+  unless system('gh', 'auth', 'status', out: File::NULL, err: File::NULL)
+
+raw = nil
+IO.popen(['gh', '-R', source, 'pr', 'list', '--state', 'open',
+          '--json', 'number', '--limit', GH_PR_LIMIT.to_s]) { |io| raw = io.read }
+abort "ERROR: gh pr list failed for #{source}" unless $?.success?
+
+numbers = begin
+  JSON.parse(raw).map { |p| p['number'] }.sort
+rescue JSON::ParserError => e
+  abort "ERROR: could not parse gh output for #{source}: #{e.message}"
+end
+
+if numbers.size >= GH_PR_LIMIT
+  warn "WARNING: hit the #{GH_PR_LIMIT}-PR list limit for #{source}; " \
+       'some open PRs may not be queued. Re-run after these drain, or raise the limit.'
+end
+
+if numbers.empty?
+  puts "#{project}: no open PRs on #{source}"
+  exit 0
+end
+
+puts "#{project}: #{numbers.size} open PR(s) on #{source}"
+
+enqueue = File.join(base_dir, 'bin', 'enqueue')
+failed  = 0
+
+numbers.each do |n|
+  topic = "#{prefix}#{n}"
+  if dry_run
+    puts "  [dry-run] would queue: #{project} #{topic}"
+  elsif system(enqueue, project, topic, out: File::NULL, err: File::NULL)
+    puts "  queued: #{project} #{topic}"
+  else
+    puts "  FAILED to queue: #{project} #{topic}"
+    failed += 1
+  end
+end
+
+puts(dry_run ? "#{project}: dry run, nothing queued"
+             : "#{project}: #{numbers.size - failed} queued, #{failed} failed")
+exit(failed.zero? ? 0 : 1)

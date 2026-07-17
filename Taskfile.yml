@@ -1,0 +1,130 @@
+version: '3'
+
+# User-facing operations for the autoreviewer.
+# DOCKER/COMPOSE are overridable for podman:
+#   task build DOCKER=podman COMPOSE="podman compose"
+
+vars:
+  DOCKER: '{{.DOCKER | default "docker"}}'
+  COMPOSE: '{{.COMPOSE | default "docker compose"}}'
+  PROFILES: --profile queue --profile web
+
+tasks:
+  default:
+    silent: true
+    cmds: [task --list]
+
+  setup:
+    desc: Create .env from the example (generates SECRET_KEY_BASE, fills UID/GID)
+    status: [test -f .env]
+    cmds:
+      - cp .env.example .env
+      - sed -i "s/^SECRET_KEY_BASE=$/SECRET_KEY_BASE=$(openssl rand -hex 64)/" .env
+      - sed -i "s/^#UID=.*/UID=$(id -u)/" .env
+      - sed -i "s/^#GID=.*/GID=$(id -g)/" .env
+      - sed -i "s|^#REPO_ROOT=.*|REPO_ROOT=$(pwd)|" .env
+      - 'echo ".env created - review it, then: task build"'
+
+  build:
+    desc: Build the base image, then the compose services (order matters)
+    deps: [setup]
+    cmds:
+      - '{{.DOCKER}} build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t autoreviewer-base:local .'
+      - 'UID=$(id -u) GID=$(id -g) {{.COMPOSE}} {{.PROFILES}} build'
+
+  up:
+    desc: Start review queue + webapp
+    deps: [setup]
+    cmds: ['{{.COMPOSE}} {{.PROFILES}} up -d']
+
+  up-web:
+    desc: Start only the webapp (server mode)
+    deps: [setup]
+    cmds: ['{{.COMPOSE}} --profile web up -d']
+
+  down:
+    desc: Stop everything
+    cmds: ['{{.COMPOSE}} {{.PROFILES}} down']
+
+  logs:
+    desc: Tail service logs
+    cmds: ['{{.COMPOSE}} {{.PROFILES}} logs -f --tail=100']
+
+  init-workspace:
+    desc: Create workspace/ from the example and git init it
+    status: [test -e workspace]
+    cmds:
+      - cp -r examples/workspace workspace
+      - git -C workspace init -b main
+      - git -C workspace add -A
+      - git -C workspace commit -m "init workspace from example"
+
+  new-project:
+    desc: 'Copy the project template (NAME=<project>); finish it with task claude'
+    requires: { vars: [NAME] }
+    cmds:
+      - test ! -e workspace/{{.NAME}}
+      - cp -r workspace/_template workspace/{{.NAME}}
+      - sed -i 's/CHANGEME/{{.NAME}}/g' workspace/{{.NAME}}/project.yaml
+      - mkdir -p workspace/.claude/commands/{{.NAME}}
+      - sed 's/<PROJECT>/{{.NAME}}/g' workspace/.claude/commands/_git-pr/review-patch.md > workspace/.claude/commands/{{.NAME}}/review-patch.md
+      - 'echo "created workspace/{{.NAME}} - fill in build config, e.g.: task claude"'
+
+  init-master:
+    desc: 'Clone a project master/ checkout from its project.yaml clone_url (PROJ=<name>)'
+    requires: { vars: [PROJ] }
+    cmds: ['{{.COMPOSE}} run --rm --no-deps review-queue bin/init-master {{.PROJ}}']
+
+  login:
+    desc: First-time claude login inside the container (auth persists in the home volume)
+    interactive: true
+    cmds: ['{{.COMPOSE}} run --rm --no-deps review-queue claude /login']
+
+  ssh-setup:
+    desc: Generate a deploy key in the container home; register the printed pubkey with your forge
+    cmds:
+      - '{{.COMPOSE}} run --rm --no-deps review-queue bash -lc "mkdir -p ~/.ssh && chmod 700 ~/.ssh && [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519 -C autoreviewer; echo; echo Add this deploy key with write access:; cat ~/.ssh/id_ed25519.pub"'
+
+  enqueue:
+    desc: 'Queue a review: task enqueue -- [project] <topic>...'
+    cmds: ['{{.COMPOSE}} exec review-queue bin/enqueue {{.CLI_ARGS}}']
+
+  attach:
+    desc: Attach to the review tmux session (Ctrl-b d to detach)
+    interactive: true
+    cmds: ['{{.COMPOSE}} exec review-queue tmux attach -t reviews']
+
+  claude:
+    desc: Interactive claude session in the workspace
+    dotenv: ['.env']
+    interactive: true
+    cmds: ['{{.COMPOSE}} exec -w "$REPO_ROOT/workspace" review-queue claude --dangerously-skip-permissions']
+
+  shell:
+    desc: 'Shell in the container (PROJ=<name> for a project dir)'
+    dotenv: ['.env']
+    interactive: true
+    cmds: ['{{.COMPOSE}} exec -w "$REPO_ROOT/workspace/{{.PROJ | default ""}}" review-queue bash']
+
+  proj:
+    desc: 'Run a project Taskfile inside the container: task proj -- <project> <task> [VARS...]'
+    dotenv: ['.env']
+    cmds:
+      - |
+        set -- {{.CLI_ARGS}}
+        p="$1"; shift
+        {{.COMPOSE}} exec -w "$REPO_ROOT/workspace/$p" review-queue task "$@"
+
+  doctor:
+    desc: Run environment checks (same guardrails as queue startup)
+    cmds:
+      - 'test -f .env || { echo "FAIL .env missing - run: task setup"; exit 1; }'
+      - 'test -d workspace || { echo "FAIL workspace/ missing - task init-workspace or clone your repo"; exit 1; }'
+      - '{{.COMPOSE}} run --rm --no-deps review-queue bin/review-queue --check'
+
+  test:
+    desc: Run the script test suites in the container
+    cmds:
+      - '{{.COMPOSE}} run --rm --no-deps review-queue ruby test/findings-metadata_test.rb'
+      - '{{.COMPOSE}} run --rm --no-deps review-queue ruby test/review-poll_test.rb'
+

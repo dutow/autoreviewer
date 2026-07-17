@@ -1,0 +1,4 @@
+psp_branch: PSP_REL_16_STABLE
+psp_config: debug-meson
+build_args:
+  - -Dbuildtype=debug

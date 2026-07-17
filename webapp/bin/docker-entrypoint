@@ -1,0 +1,13 @@
+#!/bin/bash -e
+
+if [ "${RAILS_ENV:-}" = "production" ] && [ -z "${SECRET_KEY_BASE:-}" ]; then
+  echo "ERROR: SECRET_KEY_BASE is empty. Generate one: openssl rand -hex 64, put it in .env" >&2
+  exit 1
+fi
+
+# If running the rails server then create or migrate existing database
+if [ "${@: -2:1}" == "./bin/rails" ] && [ "${@: -1:1}" == "server" ]; then
+  ./bin/rails db:prepare
+fi
+
+exec "${@}"

@@ -1,0 +1,56 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# Create a project's master/ checkout from its project.yaml clone_url.
+# One-shot, idempotent: skips if master/ already exists.
+#
+# GitHub-PR projects (github-pr ingestion hook) create master/ at ingest time
+# and need no clone_url. This is for the mailing-list-style projects whose
+# ingest/build hooks assume master/ already exists (e.g. postgres).
+#
+# Usage: init-master <project>
+
+require 'yaml'
+
+def env_or(name, default)
+  v = ENV[name].to_s
+  v.empty? ? default : v
+end
+
+base_dir = File.expand_path('..', __dir__)
+workspace_dir = File.expand_path(env_or('WORKSPACE_DIR', File.join(base_dir, 'workspace')))
+
+project = ARGV.shift
+abort 'Usage: init-master <project>' unless project
+
+project_dir = File.join(workspace_dir, project)
+abort "ERROR: project '#{project}' not found in #{workspace_dir}" unless File.directory?(project_dir)
+
+yaml = File.join(project_dir, 'project.yaml')
+abort "ERROR: #{yaml} not found" unless File.exist?(yaml)
+cfg = YAML.safe_load_file(yaml)
+
+clone_url = cfg['clone_url'].to_s
+if clone_url.empty?
+  abort "ERROR: no clone_url in #{yaml}. GitHub-PR projects create master/ " \
+        'at ingest time; add a clone_url to bootstrap a mailing-list project.'
+end
+
+master = File.join(project_dir, 'master')
+if File.directory?(master)
+  puts "master checkout already exists: #{master}"
+  exit 0
+end
+
+puts "cloning #{clone_url} -> #{master}"
+abort 'ERROR: git clone failed' unless system('git', 'clone', clone_url, master)
+
+base = cfg['base_branch'].to_s
+unless base.empty?
+  current = `git -C #{master} rev-parse --abbrev-ref HEAD`.strip
+  if current != base && !system('git', '-C', master, 'checkout', base)
+    warn "WARNING: could not check out base_branch '#{base}' (clone default: #{current})"
+  end
+end
+
+puts "done: #{master}"

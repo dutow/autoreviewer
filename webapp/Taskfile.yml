@@ -1,0 +1,14 @@
+version: '3'
+
+# Webapp helpers, dev only. Prod is driven by the top-level compose now.
+
+tasks:
+  dev:
+    desc: run dev server (google oidc needs the localhost redirect uri)
+    cmds: [bin/rails server]
+  test:
+    desc: run the test suite
+    cmds: [bin/rails test]
+  reindex-dev:
+    desc: force full reindex locally
+    cmds: [bin/rails reindex:full]

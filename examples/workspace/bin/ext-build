@@ -1,0 +1,164 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# Generic PGXS extension build hook.
+# Usage: ext-build --project <project.yaml> <source> <config_name>
+#   <source>      review topic (pr<N>) or 'master'
+#   <config_name> a file under <name>/configs/ pinning a PSP install
+#
+# Builds a standalone PGXS extension (make ... PG_CONFIG=<pg_config>) against a
+# PSP install resolved by convention:
+#   psp/builds/<psp_branch>/<psp_config>/install
+# If that install is missing it is built first via bin/pg-build, exactly like
+# pg_tde/pg_tde-build does. The extension is installed into that PSP
+# install, so its bin/{initdb,pg_ctl,psql} can load the freshly built module.
+#
+# Config keys (<name>/configs/<config_name>.yaml):
+#   psp_branch:  <branch>      required — PSP stable branch to build/use
+#   psp_config:  <config>      required — PSP build config (under psp/configs)
+#   make_args:   [ ... ]       optional — extra make variables (e.g. USE_PGXS=1)
+#   run_tests:   true|false    optional — run `make installcheck` (needs a server); default false
+
+require 'yaml'
+require 'optparse'
+require 'fileutils'
+require 'open3'
+require 'shellwords'
+require 'time'
+
+$stdout.sync = true
+
+project_yaml = nil
+OptionParser.new do |o|
+  o.on('--project PATH', 'Path to project.yaml') { |v| project_yaml = v }
+end.order!(ARGV)
+
+abort 'Usage: ext-build --project <project.yaml> <source> <config_name>' if ARGV.size < 2
+source      = ARGV[0]
+config_name = ARGV[1]
+
+project_yaml = File.expand_path(project_yaml) if project_yaml
+project_dir  = project_yaml ? File.dirname(project_yaml) : __dir__
+repo_root    = File.expand_path('..', project_dir)
+project_cfg  = project_yaml ? YAML.safe_load_file(project_yaml) : {}
+name         = project_cfg['name'] || File.basename(project_dir)
+
+config_path = File.join(project_dir, 'configs', "#{config_name}.yaml")
+abort "ERROR: config not found: #{config_path}" unless File.exist?(config_path)
+cfg = YAML.safe_load_file(config_path)
+
+psp_branch = cfg['psp_branch'] or abort 'ERROR: config missing psp_branch'
+psp_config = cfg['psp_config'] or abort 'ERROR: config missing psp_config'
+make_args  = cfg['make_args'] || []
+run_tests  = cfg.fetch('run_tests', false)
+
+source_dir =
+  if source == 'master'
+    File.join(project_dir, 'master')
+  else
+    File.join(project_dir, 'review', source)
+  end
+abort "ERROR: source dir not found: #{source_dir}" unless File.directory?(source_dir)
+
+psp_yaml    = File.join(repo_root, 'psp', 'project.yaml')
+psp_install = File.join(repo_root, 'psp', 'builds', psp_branch, psp_config, 'install')
+pg_config   = File.join(psp_install, 'bin', 'pg_config')
+
+unless File.executable?(pg_config)
+  puts "ext-build: PSP install missing, building #{psp_branch}/#{psp_config}..."
+  pg_build = File.join(repo_root, 'bin', 'pg-build')
+  ok = system(pg_build, '--project', psp_yaml, psp_branch, psp_config)
+  abort 'ERROR: PSP auto-build failed' unless ok
+  abort "ERROR: pg_config still missing after build: #{pg_config}" unless File.executable?(pg_config)
+end
+
+build_base = File.join(project_dir, 'builds', source, config_name)
+src_dir    = File.join(build_base, 'src')
+log_dir    = File.join(build_base, 'logs')
+FileUtils.rm_rf(build_base)
+FileUtils.mkdir_p(src_dir)
+FileUtils.mkdir_p(log_dir)
+
+nproc = begin
+  n = `nproc`.strip.to_i
+  n.positive? ? n.to_s : '4'
+rescue Errno::ENOENT
+  '4'
+end
+
+status = {}
+started = Time.now
+
+run = lambda do |label, cmd, chdir: nil|
+  log = File.join(log_dir, "#{label}.log")
+  print "#{label}... "
+  ok = false
+  File.open(log, 'w') do |f|
+    f.sync = true
+    opts = chdir ? { chdir: chdir } : {}
+    Open3.popen2e(*cmd, opts) do |_i, oe, wt|
+      oe.each_line { |l| f.write(l) }
+      ok = wt.value.success?
+    end
+  end
+  puts(ok ? 'OK' : "FAILED (see logs/#{label}.log)")
+  ok
+end
+
+# Build out of the review worktree: export the checked-out tree (PR head or
+# master tip) into the build dir so the worktree stays clean and the build is
+# reproducible. Fall back to a plain copy for non-git sources.
+setup_ok =
+  if File.directory?(File.join(source_dir, '.git')) || File.exist?(File.join(source_dir, '.git'))
+    run.call('setup',
+      ['bash', '-c', "git -C #{Shellwords.escape(source_dir)} archive HEAD | tar -x -C #{Shellwords.escape(src_dir)}"])
+  else
+    FileUtils.cp_r(Dir.glob(File.join(source_dir, '*')), src_dir)
+    true
+  end
+status['setup'] = setup_ok ? 'success' : 'failed'
+
+make = ->(*extra) { ['make', '-C', src_dir, "PG_CONFIG=#{pg_config}", *make_args, *extra] }
+
+build_ok = false
+if setup_ok
+  build_ok = run.call('build', make.call('-j', nproc))
+  status['build'] = build_ok ? 'success' : 'failed'
+else
+  status['build'] = 'skipped'
+end
+
+if build_ok
+  status['install'] = run.call('install', make.call('install')) ? 'success' : 'failed'
+else
+  status['install'] = 'skipped'
+end
+
+if build_ok && run_tests
+  # installcheck needs a running server; the review/validation step starts one
+  # against the PSP install. Captured here best-effort.
+  status['test'] = run.call('test', make.call('installcheck')) ? 'success' : 'failed'
+else
+  status['test'] = 'skipped'
+end
+
+File.write(File.join(build_base, 'status.yaml'), YAML.dump({
+  'project'     => name,
+  'source'      => source,
+  'config'      => config_name,
+  'psp_branch'  => psp_branch,
+  'psp_config'  => psp_config,
+  'psp_install' => psp_install,
+  'pg_config'   => pg_config,
+  'started_at'  => started.iso8601,
+  'setup'       => status['setup'],
+  'build'       => status['build'],
+  'install'     => status['install'],
+  'test'        => status['test'],
+  'finished_at' => Time.now.iso8601,
+}))
+
+puts "=== #{name} Build Summary ==="
+puts "Source:  #{source}"
+puts "Config:  #{config_name} (PSP #{psp_branch}/#{psp_config})"
+%w[setup build install test].each { |k| puts "#{(k.capitalize + ':').ljust(9)} #{status[k]}" }

@@ -1,0 +1,24 @@
+# psp — Percona Server for PostgreSQL (percona/postgres) review project.
+name: psp
+source: percona/postgres
+base_branch: PSP_REL_18_STABLE   # default/fallback; real base comes from the PR
+topic_prefix: pr
+
+# github-pr populates master/ at ingest, but pg_tde builds against a psp stable
+# branch before any psp PR is reviewed, so pre-seed master: task init-master PROJ=psp.
+clone_url: https://github.com/percona/postgres.git
+
+ingestion:
+  hook: github-pr
+
+build:
+  hook: pg-build
+  default_config: debug-meson
+  queue_configs:
+    - debug-meson
+
+review:
+  command: psp:review-patch
+
+poll:
+  enabled: true   # auto-poll open PRs when review-queue runs

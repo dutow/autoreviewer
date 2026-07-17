@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$REVIEW_DONE_FILE\" ] || exit 0; p=$(jq '((.background_tasks // [])|length)+((.session_crons // [])|length)' 2>/dev/null); [ \"$p\" = 0 ] && touch \"$REVIEW_DONE_FILE\"; exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,66 @@
+# requires .env (run 'task setup' or: cp .env.example .env) - env_file is mandatory and podman-compose cannot mark it optional
+services:
+  review-queue:
+    build:
+      context: .
+      dockerfile: ${QUEUE_DOCKERFILE:-Dockerfile}
+      # resolved from your shell env or .env; 'task setup' writes them into .env - plain 'docker compose build' without them bakes uid 1000
+      args:
+        UID: "${UID:-1000}"
+        GID: "${GID:-1000}"
+    image: autoreviewer-queue:local
+    profiles: [queue]
+    env_file: .env
+    # mount the repo at its host path so git worktrees (absolute paths baked
+    # into .git links) resolve the same on host and in the container.
+    # REPO_ROOT is written by 'task setup'; re-run it if you move the checkout.
+    working_dir: ${REPO_ROOT:?run 'task setup' to set REPO_ROOT}
+    # tmux in the foreground keeps the container alive and is what
+    # 'task attach' connects to; review-queue runs in the first window.
+    # if preflight fails the container parks on sleep infinity instead of
+    # crash-looping. stopping the stack is NOT graceful to in-flight
+    # reviews (tmux server is killed); reviews are resumable so this is
+    # accepted.
+    command:
+      - sh
+      - -c
+      - |
+        bin/review-queue --check || {
+          echo "preflight failed - fix the issues above (cp .env.example .env, task init-workspace, task login), then: task up"
+          exec sleep infinity
+        }
+        exec tmux new-session -s reviews -n orchestrator bin/review-queue
+    tty: true
+    stdin_open: true
+    init: true
+    stop_grace_period: 30s
+    # host repo lives on a partition labeled unlabeled_t; a confined
+    # container is denied getattr/read on it under SELinux MCS. disable
+    # label confinement so the bind mount is accessible (dev tooling stack).
+    security_opt:
+      - label=disable
+    volumes:
+      - ${REPO_ROOT:?run 'task setup' to set REPO_ROOT}:${REPO_ROOT}
+      - home:/home/reviewer
+    restart: unless-stopped
+
+  webapp:
+    build: ./webapp
+    profiles: [web]
+    env_file: .env
+    environment:
+      RAILS_ENV: production
+      REVIEWS_ROOT: /workspace
+      DATABASE_PATH: /data/production.sqlite3
+    security_opt:
+      - label=disable
+    volumes:
+      - ./workspace:/workspace:ro
+      - dbdata:/data
+    ports:
+      - "127.0.0.1:${WEBAPP_PORT:-8080}:80"
+    restart: unless-stopped
+
+volumes:
+  home:
+  dbdata:

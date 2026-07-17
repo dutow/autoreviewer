@@ -1,0 +1,88 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# postgres ingestion hook.
+# Wraps the EXTERNAL bin/hackorum-patch (never modified) and normalizes its
+# metadata to the project ingestion contract.
+#
+# Usage: ingest --project <project.yaml> <topic>
+#   <topic> may be "t139942" or "139942"; the canonical dir name is "t139942".
+
+require 'yaml'
+require 'json'
+require 'optparse'
+require 'net/http'
+require 'cgi'
+
+# thread subject from the topic page; nil on any failure (title is optional)
+def fetch_title(url, limit = 5)
+  return nil if url.nil? || limit.zero?
+
+  res = Net::HTTP.get_response(URI(url))
+  case res
+  when Net::HTTPRedirection then return fetch_title(URI.join(url, res['location']).to_s, limit - 1)
+  when Net::HTTPSuccess then body = res.body
+  else return nil
+  end
+
+  m = body.match(%r{<title>(.*?)</title>}m)
+  return nil unless m
+
+  # hackorum double-escapes entities, unescape twice
+  title = CGI.unescapeHTML(CGI.unescapeHTML(m[1])).gsub(/\s+/, ' ').strip
+  title = title.sub(/\APostgreSQL:\s*/, '').sub(/\s*-\s*Hackorum\z/, '')
+  title.empty? ? nil : title
+rescue StandardError => e
+  warn "ingest: title fetch failed #{url}: #{e.message}"
+  nil
+end
+
+project_yaml = nil
+OptionParser.new do |o|
+  o.on('--project PATH', 'Path to project.yaml') { |v| project_yaml = v }
+end.order!(ARGV)
+
+abort 'ERROR: --project <project.yaml> is required' unless project_yaml
+topic_arg = ARGV.shift
+abort 'ERROR: topic argument is required' unless topic_arg
+
+project_yaml = File.expand_path(project_yaml)
+config = YAML.safe_load_file(project_yaml)
+project_dir = File.dirname(project_yaml)
+repo_root   = File.expand_path('..', project_dir)   # <name> -> workspace root
+
+numeric   = topic_arg.sub(/\At/, '')
+canonical = "t#{numeric}"
+master    = File.join(project_dir, 'master')
+hackorum  = File.join(repo_root, 'bin', 'hackorum-patch')
+
+abort "ERROR: master checkout not found: #{master}" unless File.directory?(master)
+abort "ERROR: hackorum-patch not found: #{hackorum}" unless File.executable?(hackorum)
+
+review_dir = File.join(project_dir, 'review', canonical)
+
+# Force worktree mode. hackorum's --worktree=auto falls back to branch mode when
+# master/ has no worktrees yet, which checks out the review branch inside master/
+# and dirties the base checkout. Pin the path to where we read results back from.
+puts "ingest: running hackorum-patch --force --worktree=yes #{numeric} (cwd=#{master})"
+ok = system(hackorum, '--force', '--worktree=yes', "--worktree-path=#{review_dir}", numeric, chdir: master)
+abort 'ERROR: hackorum-patch failed' unless ok
+
+# hackorum >=1.3 writes .hackorum/<topic>.json; older versions wrote metadata.json.
+hk_dir  = File.join(review_dir, '.hackorum')
+hk_path = ["#{numeric}.json", 'metadata.json'].map { |f| File.join(hk_dir, f) }.find { |p| File.exist?(p) }
+abort "ERROR: expected hackorum metadata in #{hk_dir}" unless hk_path
+
+hk = JSON.parse(File.read(hk_path))
+normalized = {
+  'project'     => config['name'],
+  'topic'       => canonical,
+  'version'     => hk['attachment_number'],
+  'title'       => fetch_title(hk['hackorum_url'] || hk['upstream_url']),
+  'source_url'  => hk['upstream_url'],
+  'base_branch' => config['base_branch'],
+}.compact
+
+out = File.join(review_dir, 'metadata.json')
+File.write(out, JSON.pretty_generate(normalized) + "\n")
+puts "ingest: wrote normalized metadata -> #{out}"

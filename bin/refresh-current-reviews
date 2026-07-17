@@ -1,0 +1,50 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Rebuilds the top-level current-reviews/ directory so it holds one symlink
+# per project, named by the project, pointing at the project's own
+# current-reviews/ directory. Idempotent: creates missing links, fixes
+# wrong targets, and prunes links for projects that no longer exist.
+
+require 'fileutils'
+
+base_dir = File.expand_path('..', __dir__)
+workspace_dir = File.expand_path(ENV['WORKSPACE_DIR'] || File.join(base_dir, 'workspace'))
+projects_dir = workspace_dir
+top_dir = File.join(workspace_dir, 'current-reviews')
+
+FileUtils.mkdir_p(top_dir)
+
+projects = Dir.children(projects_dir).select do |name|
+  next false if name.start_with?('_')
+  next false if %w[bin state].include?(name) || name.start_with?('.')
+
+  File.directory?(File.join(projects_dir, name, 'current-reviews'))
+end.sort
+
+projects.each do |name|
+  link = File.join(top_dir, name)
+  target = File.join('..', name, 'current-reviews')
+
+  if File.symlink?(link)
+    next if File.readlink(link) == target
+
+    File.delete(link)
+  elsif File.exist?(link)
+    warn "skip #{name}: exists and is not a symlink"
+    next
+  end
+
+  File.symlink(target, link)
+  puts "link #{name} -> #{target}"
+end
+
+valid = projects.to_set
+Dir.children(top_dir).each do |entry|
+  path = File.join(top_dir, entry)
+  next unless File.symlink?(path)
+  next if valid.include?(entry)
+
+  File.delete(path)
+  puts "prune #{entry}"
+end

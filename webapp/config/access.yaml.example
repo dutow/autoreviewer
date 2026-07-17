@@ -1,0 +1,3 @@
+auth:
+  allowed_domains: []   # e.g. ["example.com"]
+  allowed_emails: []    # e.g. ["you@example.com"]

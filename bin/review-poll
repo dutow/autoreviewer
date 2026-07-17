@@ -1,0 +1,310 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# PR update poller. While review-queue runs, watches opt-in GitHub-PR projects
+# (project.yaml with `poll.enabled: true` and a `source`) and enqueues any open
+# PR whose head commit changed since it was last enqueued.
+#
+# Usage: review-poll [--once]
+# Env:   REVIEW_POLL_INTERVAL (seconds, default 180)
+#        REVIEW_POLL_STATE    (state file, default <repo>/state/poll.state)
+#        REVIEW_POLL_COMMITS_NOW (bypass commit-review window+throttle once; don't export permanently)
+
+require 'json'
+require 'time'
+require 'yaml'
+require 'fileutils'
+require 'shellwords'
+
+$stdout.sync = true
+
+class ReviewPoll
+  attr_reader :state, :base_dir
+
+  def initialize(once: false, base_dir: File.expand_path('..', __dir__))
+    @base_dir = base_dir
+    @workspace_dir = File.expand_path(env_or('WORKSPACE_DIR', File.join(@base_dir, 'workspace')))
+    @projects_dir = @workspace_dir
+    state_dir = File.expand_path(env_or('STATE_DIR', File.join(@base_dir, 'state')))
+    @state_file = env_or('REVIEW_POLL_STATE', File.join(state_dir, 'poll.state'))
+    FileUtils.mkdir_p(File.dirname(@state_file))
+    @interval = (ENV['REVIEW_POLL_INTERVAL'] || 180).to_i
+    @once = once
+    @state = load_state
+  end
+
+  def env_or(name, default)
+    v = ENV[name].to_s
+    v.empty? ? default : v
+  end
+
+  def load_state
+    return {} unless File.exist?(@state_file)
+    JSON.parse(File.read(@state_file))
+  rescue JSON::ParserError
+    warn "review-poll: corrupt state file #{@state_file}, starting fresh"
+    {}
+  end
+
+  def save_state
+    File.write(@state_file, JSON.pretty_generate(@state) + "\n")
+  end
+
+  def enabled_projects
+    Dir.glob(File.join(@projects_dir, '*', 'project.yaml')).sort.filter_map do |yaml|
+      cfg = YAML.safe_load_file(yaml)
+      next unless cfg && cfg.dig('poll', 'enabled') && cfg['base_branch']
+      dir_name = File.basename(File.dirname(yaml))
+      raw_name = cfg['name']
+      {
+        name:        raw_name.is_a?(String) ? raw_name : dir_name,
+        source:      cfg['source'],
+        prefix:      cfg['topic_prefix'] || 'pr',
+        base_branch: cfg['base_branch'],
+        master_dir:  File.join(@projects_dir, dir_name, 'master'),
+        commit_review: cfg['commit_review'],
+      }
+    rescue StandardError => e
+      warn "review-poll: skipping #{yaml}: #{e.message}"
+      nil
+    end
+  end
+
+  # Pure classifier. prev: nil (project not yet baselined) or Hash{topic => sha}.
+  # prs: Array of {topic:, head:}. Returns {baseline:, decisions:[{topic:,head:,status:}]}.
+  def plan(prev, prs)
+    return { baseline: true, decisions: [] } if prev.nil?
+    decisions = prs.map do |pr|
+      status = prev[pr[:topic]] == pr[:head] ? :unchanged : :changed
+      { topic: pr[:topic], head: pr[:head], status: status }
+    end
+    { baseline: false, decisions: decisions }
+  end
+
+  COMMIT_WINDOW_DEFAULT = '02:00-05:00'
+  COMMIT_MAX_BATCH_DEFAULT = 10
+  COMMIT_MIN_GAP = 20 * 3600 # once per day, tolerant of window-edge drift
+  COMMIT_BASELINE_DEPTH = 20
+
+  def in_window?(now, window_str)
+    window_str = COMMIT_WINDOW_DEFAULT if window_str.nil? || window_str.empty?
+    m = window_str.match(/\A(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})\z/)
+    return false unless m
+    start_m = m[1].to_i * 60 + m[2].to_i
+    end_m   = m[3].to_i * 60 + m[4].to_i
+    cur = now.hour * 60 + now.min
+    start_m <= end_m ? (cur >= start_m && cur < end_m) : (cur >= start_m || cur < end_m)
+  end
+
+  def commit_batch_due?(cr_state, now, window_str, bypass: false)
+    return true if bypass
+    return false unless in_window?(now, window_str)
+    last = cr_state && cr_state['last_enqueued_at']
+    last_t = (Time.parse(last) rescue nil) if last
+    last_t.nil? || (now - last_t) >= COMMIT_MIN_GAP
+  end
+
+  # shas: new commits oldest-first. Returns consecutive [from, to] ranges
+  # chained from last_sha, each covering at most max_batch commits.
+  # Assumes linear history: with merges, consecutive ranges may overlap (never lose commits).
+  def chunk_commits(last_sha, shas, max_batch)
+    max_batch = COMMIT_MAX_BATCH_DEFAULT if max_batch.to_i < 1
+    from = last_sha
+    shas.each_slice(max_batch).map do |slice|
+      chunk = [from, slice.last]
+      from = slice.last
+      chunk
+    end
+  end
+
+  def git_out(dir, *args)
+    out = nil
+    IO.popen(['git', '-C', dir, *args], err: File::NULL) { |io| out = io.read }
+    $?.success? ? out.strip : nil
+  end
+
+  def baseline_sha(dir, head)
+    git_out(dir, 'rev-parse', "#{head}~#{COMMIT_BASELINE_DEPTH}") || head
+  end
+
+  def commit_review_state(name)
+    st = @state[name]
+    st.is_a?(Hash) ? st['commit_review'] : nil
+  end
+
+  def store_commit_review_state(name, cr)
+    st = @state[name]
+    st = {} unless st.is_a?(Hash)
+    st['commit_review'] = cr
+    @state[name] = st
+    save_state
+  end
+
+  def enqueue_commit_batch(project, from, to)
+    system(File.join(@base_dir, 'bin', 'enqueue'), project, 'commits', "#{from}..#{to}",
+           out: File::NULL, err: File::NULL)
+  end
+
+  def process_commit_reviews(proj, enqueue_commits: method(:enqueue_commit_batch), now: Time.now)
+    cfg = proj[:commit_review]
+    return unless cfg.is_a?(Hash) && cfg['command']
+    return log("WARNING: #{proj[:name]}: #{proj[:master_dir]} is not a git repo") unless git_repo?(proj[:master_dir])
+
+    head = git_out(proj[:master_dir], 'rev-parse', "origin/#{proj[:base_branch]}")
+    return log("WARNING: #{proj[:name]}: cannot resolve origin/#{proj[:base_branch]}") unless head
+
+    cr = commit_review_state(proj[:name])
+    if cr.nil? || cr['last_sha'].nil?
+      base = baseline_sha(proj[:master_dir], head)
+      store_commit_review_state(proj[:name], { 'last_sha' => base })
+      return log("#{proj[:name]}: commit-review baseline #{base[0, 7]}")
+    end
+
+    bypass = !ENV['REVIEW_POLL_COMMITS_NOW'].to_s.empty?
+    return unless commit_batch_due?(cr, now, cfg['window'], bypass: bypass)
+
+    raw = git_out(proj[:master_dir], 'rev-list', '--reverse', "#{cr['last_sha']}..#{head}")
+    if raw.nil?
+      base = baseline_sha(proj[:master_dir], head)
+      log "WARNING: #{proj[:name]}: #{cr['last_sha'][0, 7]} not in origin/#{proj[:base_branch]}, re-baselining to #{base[0, 7]}"
+      return store_commit_review_state(proj[:name], { 'last_sha' => base })
+    end
+    shas = raw.split("\n").reject(&:empty?)
+    return if shas.empty?
+
+    max_batch = (cfg['max_batch'] || COMMIT_MAX_BATCH_DEFAULT).to_i
+    chunks = chunk_commits(cr['last_sha'], shas, max_batch)
+    chunks.each_with_index do |(from, to), i|
+      unless enqueue_commits.call(proj[:name], from, to)
+        log "#{proj[:name]}: commits #{from[0, 7]}..#{to[0, 7]} enqueue failed, remainder retries next window"
+        break
+      end
+      store_commit_review_state(proj[:name],
+                                { 'last_sha' => to, 'last_enqueued_at' => now.getutc.iso8601 })
+      log "#{proj[:name]}: commits #{from[0, 7]}..#{to[0, 7]} enqueued (chunk #{i + 1}/#{chunks.size})"
+    end
+  end
+
+  def open_prs(source)
+    raw = nil
+    IO.popen(['gh', '-R', source, 'pr', 'list', '--state', 'open',
+              '--json', 'number,headRefOid,baseRefName', '--limit', '200']) { |io| raw = io.read }
+    unless $?.success?
+      log "WARNING: gh pr list failed for #{source}, skipping this cycle"
+      return nil
+    end
+    JSON.parse(raw).map { |p| { number: p['number'], head: p['headRefOid'], base: p['baseRefName'] } }
+  rescue JSON::ParserError => e
+    log "WARNING: could not parse gh output for #{source}: #{e.message}"
+    nil
+  rescue SystemCallError => e
+    log "WARNING: could not run gh for #{source}: #{e.message}"
+    nil
+  end
+
+  def enqueue_topic(project, topic)
+    system(File.join(@base_dir, 'bin', 'enqueue'), project, topic,
+           out: File::NULL, err: File::NULL)
+  end
+
+  def git_repo?(dir)
+    dir && File.directory?(dir) &&
+      system('git', '-C', dir, 'rev-parse', '--git-dir', out: File::NULL, err: File::NULL)
+  end
+
+  def checked_out_branch(dir)
+    branch = nil
+    IO.popen(['git', '-C', dir, 'symbolic-ref', '--quiet', '--short', 'HEAD'],
+             err: File::NULL) { |io| branch = io.read.to_s.strip }
+    $?.success? && !branch.empty? ? branch : nil
+  end
+
+  def refresh_one(master_dir, base)
+    return log("WARNING: #{master_dir} is not a git repo, skipping base #{base}") unless git_repo?(master_dir)
+    unless system('git', '-C', master_dir, 'fetch', 'origin', base, out: File::NULL, err: File::NULL)
+      return log("WARNING: git fetch origin #{base} failed in #{master_dir}")
+    end
+    ok =
+      if checked_out_branch(master_dir) == base
+        system('git', '-C', master_dir, 'reset', '--hard', "origin/#{base}", out: File::NULL, err: File::NULL)
+      else
+        system('git', '-C', master_dir, 'branch', '-f', base, "origin/#{base}", out: File::NULL, err: File::NULL)
+      end
+    ok ? log("refreshed #{base} in #{master_dir}") : log("WARNING: could not update #{base} in #{master_dir}")
+  end
+
+  def refresh_bases(proj, bases)
+    bases.compact.uniq.each { |b| refresh_one(proj[:master_dir], b) }
+  end
+
+  def run_once(projects: enabled_projects, fetch: method(:open_prs),
+               enqueue: method(:enqueue_topic), refresh: method(:refresh_bases),
+               enqueue_commits: method(:enqueue_commit_batch), now: Time.now)
+    return if projects.empty?
+    log "poll cycle: #{projects.map { |p| p[:name] }.join(', ')}"
+    projects.each do |proj|
+      if proj[:source]
+        raw = fetch.call(proj[:source])
+        next if raw.nil?
+        prs = raw.map { |p| { topic: "#{proj[:prefix]}#{p[:number]}", head: p[:head] } }
+        bases = raw.map { |p| p[:base] }.compact.uniq | [proj[:base_branch]]
+      else
+        prs = []
+        bases = [proj[:base_branch]]
+      end
+
+      refresh.call(proj, bases)
+      prev = @state[proj[:name]] # read before commit reviews touch state
+      process_commit_reviews(proj, enqueue_commits: enqueue_commits, now: now) if proj[:commit_review]
+      next unless proj[:source]
+
+      result = plan(prev, prs)
+      cr = commit_review_state(proj[:name])
+      if result[:baseline]
+        new_map = prs.to_h { |pr| [pr[:topic], pr[:head]] }
+        new_map['commit_review'] = cr if cr
+        @state[proj[:name]] = new_map
+        log "#{proj[:name]}: baseline recorded (#{prs.size} open PRs)"
+      else
+        new_state = {}
+        result[:decisions].each do |d|
+          case d[:status]
+          when :unchanged
+            new_state[d[:topic]] = d[:head]
+          when :changed
+            kind = prev.key?(d[:topic]) ? 'new commits' : 'new PR'
+            if enqueue.call(proj[:name], d[:topic])
+              new_state[d[:topic]] = d[:head]
+              log "#{proj[:name]}: #{d[:topic]} #{kind} #{d[:head][0, 7]}, enqueued"
+            else
+              log "#{proj[:name]}: #{d[:topic]} enqueue failed, will retry next cycle"
+            end
+          end
+        end
+        new_state['commit_review'] = cr if cr
+        @state[proj[:name]] = new_state
+      end
+      save_state
+    end
+  end
+
+  def run
+    puts '=== Review PR Poller ==='
+    puts "State file: #{@state_file}"
+    puts "Interval:   #{@interval}s"
+    puts ''
+    loop do
+      run_once
+      break if @once
+      sleep @interval
+    end
+  end
+
+  def log(msg)
+    puts "[#{Time.now.strftime('%H:%M:%S')}] #{msg}"
+  end
+end
+
+if __FILE__ == $0
+  ReviewPoll.new(once: ARGV.include?('--once')).run
+end

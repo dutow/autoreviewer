@@ -1,0 +1,180 @@
+version: '3'
+
+# PostgreSQL review-cluster helpers.
+#
+# Acts on one installation, selected per command:
+#   SRC     review topic (e.g. t139733) or 'master'   (required)
+#   CONFIG  build config name                          (default: debug-meson)
+#
+# Layout (from bin/pg-build):
+#   builds/<SRC>/<CONFIG>/install/  installed binaries
+#   builds/<SRC>/<CONFIG>/data/     cluster PGDATA (created by these tasks)
+#
+# The cluster listens on a unix socket inside PGDATA only (no TCP), so any
+# number of review clusters can run at once without port collisions.
+#
+# Examples:
+#   task start SRC=t139733
+#   task psql  SRC=t139733
+#   task sql   SRC=t139733 Q='select count(*) from pg_class'
+#   task psql  SRC=master CONFIG=debug-autoconf -- -c '\dt'
+#   task reset SRC=t139733
+
+# CLI vars (SRC/CONFIG/...) only resolve inside task-scope vars/env, never in a
+# top-level vars: block — so the shared maps below are applied per task via YAML
+# anchors. Later keys may reference earlier ones.
+x-vars: &vars
+  CONFIG: '{{.CONFIG | default "debug-meson"}}'
+  DB: '{{.DB | default "postgres"}}'
+  PORT: '{{.PORT | default "54321"}}'
+  PGUSER: '{{.PGUSER | default "postgres"}}'
+  BASE: '{{.ROOT_DIR}}/builds/{{.SRC}}/{{.CONFIG | default "debug-meson"}}'
+  INSTALL: '{{.BASE}}/install'
+  BIN: '{{.INSTALL}}/bin'
+  PGDATA: '{{.BASE}}/data'
+  LOG: '{{.PGDATA}}/server.log'
+
+x-env: &env
+  PGHOST: '{{.PGDATA}}'
+  PGPORT: '{{.PORT}}'
+  PGDATABASE: '{{.DB}}'
+  PGUSER: '{{.PGUSER}}'
+  LD_LIBRARY_PATH: '{{.INSTALL}}/lib:{{.INSTALL}}/lib64'
+
+tasks:
+  default:
+    desc: List available cluster tasks
+    silent: true
+    cmds:
+      - task --list
+
+  env:
+    desc: Print the resolved paths/connection for the selected installation
+    silent: true
+    vars: *vars
+    requires:
+      vars: [SRC]
+    cmds:
+      - |
+        echo "SRC        {{.SRC}}"
+        echo "CONFIG     {{.CONFIG}}"
+        echo "INSTALL    {{.INSTALL}}"
+        echo "PGDATA     {{.PGDATA}}"
+        echo "PGHOST     {{.PGDATA}}  (unix socket)"
+        echo "PGPORT     {{.PORT}}"
+        echo "PGUSER     {{.PGUSER}}"
+        echo "PGDATABASE {{.DB}}"
+        echo "LOG        {{.LOG}}"
+
+  _check-install:
+    internal: true
+    vars: *vars
+    requires:
+      vars: [SRC]
+    cmds:
+      - |
+        if [ ! -x "{{.BIN}}/postgres" ]; then
+          echo "ERROR: no installed postgres at {{.BIN}}" >&2
+          echo "Build it first:  bin/pg-build {{.SRC}} {{.CONFIG}}" >&2
+          exit 1
+        fi
+
+  initdb:
+    desc: Initialize the cluster (idempotent — skips if PGDATA already exists)
+    vars: *vars
+    env: *env
+    deps: [_check-install]
+    status:
+      - test -f {{.PGDATA}}/PG_VERSION
+    cmds:
+      - '{{.BIN}}/initdb -D {{.PGDATA}} -U {{.PGUSER}} --no-sync'
+
+  start:
+    desc: Start the server (initdb's the cluster first if needed)
+    vars: *vars
+    env: *env
+    deps: [initdb]
+    cmds:
+      - '{{.BIN}}/pg_ctl -D {{.PGDATA}} -l {{.LOG}} -o "-k {{.PGDATA}} -p {{.PORT}} -h ''''" -w start'
+      - task: status
+        vars: { SRC: '{{.SRC}}', CONFIG: '{{.CONFIG}}' }
+
+  stop:
+    desc: Stop the server (fast shutdown)
+    vars: *vars
+    env: *env
+    deps: [_check-install]
+    cmds:
+      - '{{.BIN}}/pg_ctl -D {{.PGDATA}} -m fast -w stop'
+
+  restart:
+    desc: Restart the server
+    vars: *vars
+    env: *env
+    deps: [_check-install]
+    cmds:
+      - '{{.BIN}}/pg_ctl -D {{.PGDATA}} -l {{.LOG}} -o "-k {{.PGDATA}} -p {{.PORT}} -h ''''" -m fast -w restart'
+      - task: status
+        vars: { SRC: '{{.SRC}}', CONFIG: '{{.CONFIG}}' }
+
+  status:
+    desc: Show whether the server is running
+    vars: *vars
+    env: *env
+    deps: [_check-install]
+    cmds:
+      - '{{.BIN}}/pg_ctl -D {{.PGDATA}} status'
+
+  psql:
+    desc: 'Open psql (forward args after --, e.g. task psql SRC=t1 -- -c "\dt")'
+    vars: *vars
+    env: *env
+    deps: [_check-install]
+    interactive: true
+    cmds:
+      - '{{.BIN}}/psql {{.CLI_ARGS}}'
+
+  sql:
+    desc: 'Run one SQL statement (Q=...), e.g. task sql SRC=t1 Q="select 1"'
+    vars: *vars
+    env: *env
+    deps: [_check-install]
+    requires:
+      vars: [Q]
+    cmds:
+      - '{{.BIN}}/psql -c {{.Q | quote}}'
+
+  logs:
+    desc: 'Tail the server log (N=lines, default 50)'
+    vars: *vars
+    requires:
+      vars: [SRC]
+    cmds:
+      - tail -n {{.N | default "50"}} -f {{.LOG}}
+
+  createdb:
+    desc: 'Create a database (NAME=..., default scratch)'
+    vars: *vars
+    env: *env
+    deps: [_check-install]
+    cmds:
+      - '{{.BIN}}/createdb {{.NAME | default "scratch"}}'
+
+  reset:
+    desc: Stop the server (if running) and delete PGDATA — destroys all cluster data
+    vars: *vars
+    env: *env
+    deps: [_check-install]
+    cmds:
+      - '{{.BIN}}/pg_ctl -D {{.PGDATA}} -m immediate -w stop 2>/dev/null || true'
+      - rm -rf {{.PGDATA}}
+      - echo "Removed {{.PGDATA}}"
+
+  recreate:
+    desc: reset + initdb + start — fresh running cluster
+    vars: *vars
+    cmds:
+      - task: reset
+        vars: { SRC: '{{.SRC}}', CONFIG: '{{.CONFIG}}' }
+      - task: start
+        vars: { SRC: '{{.SRC}}', CONFIG: '{{.CONFIG}}' }

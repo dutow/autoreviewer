@@ -1,0 +1,20 @@
+# pg_tde — Percona TDE extension (percona/pg_tde) review project.
+name: pg_tde
+source: percona/pg_tde
+base_branch: main          # default/fallback; real base comes from the PR
+topic_prefix: pr
+
+ingestion:
+  hook: github-pr
+
+build:
+  hook: pg_tde-build
+  default_config: pg18-debug
+  queue_configs:
+    - pg18-debug           # active major only; build other majors on demand
+
+review:
+  command: pg_tde:review-patch
+
+poll:
+  enabled: true   # auto-poll open PRs when review-queue runs

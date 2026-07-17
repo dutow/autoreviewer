@@ -1,0 +1,31 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# Push committed output to the remote. Invoked by the review-queue watcher
+# once a review's done-sentinel appears. On push failure, opens a tmux
+# FAIL-push window with the git error; commits stay local for the next
+# successful push.
+#
+# Usage: review-push [label]
+#   label - names the failure window (FAIL-push-<label>); defaults to "review".
+
+require 'open3'
+require 'shellwords'
+
+base_dir = File.expand_path(ENV['WORKSPACE_DIR'] || File.expand_path('../workspace', __dir__))
+label = ARGV[0].to_s.empty? ? 'review' : ARGV[0]
+
+out, status = Open3.capture2e('git', 'push', chdir: base_dir)
+print out
+
+if status.success?
+  puts '[review-push] push OK'
+  exit 0
+end
+
+window = "FAIL-push-#{label}"
+error_text = "review-push: git push failed\n\n#{out}"
+system('tmux', 'new-window', '-n', window, '-d',
+       "echo #{Shellwords.escape(error_text)}; echo ''; echo 'Press Enter to close...'; read")
+warn "[review-push] push FAILED (commits remain local); notified in tmux window '#{window}'"
+exit 1

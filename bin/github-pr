@@ -1,0 +1,124 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# Shared GitHub-PR ingestion hook.
+# Usage: github-pr --project <project.yaml> pr<N>
+#
+# Populates <name>/review/pr<N>/ with a worktree checked out at the PR
+# head, a discussion.txt (PR body + comments + reviews), and a normalized
+# metadata.json. The PR base branch becomes the review base_branch.
+
+require 'yaml'
+require 'json'
+require 'optparse'
+require 'fileutils'
+
+project_yaml = nil
+OptionParser.new do |o|
+  o.on('--project PATH', 'Path to project.yaml') { |v| project_yaml = v }
+end.order!(ARGV)
+
+abort 'ERROR: --project <project.yaml> is required' unless project_yaml
+topic_arg = ARGV.shift
+abort 'ERROR: topic argument is required (e.g. pr123)' unless topic_arg
+
+project_yaml = File.expand_path(project_yaml)
+config = YAML.safe_load_file(project_yaml)
+project_dir = File.dirname(project_yaml)
+
+source = config['source']
+abort "ERROR: project.yaml has no 'source' (owner/repo) for git-PR ingestion" unless source
+
+pr = topic_arg.sub(/\Apr/, '')
+abort "ERROR: topic must be pr<number>, got #{topic_arg.inspect}" unless pr.match?(/\A\d+\z/)
+canonical = "pr#{pr}"
+
+abort 'ERROR: gh is not authenticated (run `gh auth login` or set GH_TOKEN)' \
+  unless system('gh', 'auth', 'status', out: File::NULL, err: File::NULL)
+
+master = File.join(project_dir, 'master')
+abort "ERROR: master checkout not found: #{master}" unless File.directory?(master)
+
+puts "github-pr: fetching PR ##{pr} metadata from #{source}"
+fields = 'baseRefName,url,headRefOid,title,body,author,comments,reviews'
+raw = nil
+IO.popen(['gh', '-R', source, 'pr', 'view', pr, '--json', fields]) { |io| raw = io.read }
+abort "ERROR: gh pr view failed for #{source}##{pr}" unless $?.success?
+pr_data = begin
+  JSON.parse(raw)
+rescue JSON::ParserError => e
+  abort "ERROR: could not parse gh pr view output for #{source}##{pr}: #{e.message}"
+end
+
+base = pr_data['baseRefName']
+url  = pr_data['url']
+head = pr_data['headRefOid']
+
+puts "github-pr: fetching refs (base=#{base}, head=#{head[0, 12]})"
+system('git', '-C', master, 'fetch', 'origin', base) || abort('ERROR: fetch base failed')
+system('git', '-C', master, 'fetch', 'origin', "pull/#{pr}/head") || abort('ERROR: fetch PR head failed')
+
+review_dir = File.join(project_dir, 'review', canonical)
+if File.directory?(review_dir)
+  system('git', '-C', review_dir, 'checkout', '--detach', head) ||
+    abort('ERROR: could not checkout PR head in existing worktree')
+  system('git', '-C', review_dir, 'reset', '--hard', head)
+else
+  FileUtils.mkdir_p(File.dirname(review_dir))
+  system('git', '-C', master, 'worktree', 'add', '--detach', review_dir, head) ||
+    abort('ERROR: could not create review worktree')
+end
+
+# Discussion: body + issue comments + reviews + review-thread comments.
+def section(title) = "\n\n===== #{title} =====\n\n"
+disc = +""
+disc << "PR ##{pr}: #{pr_data['title']}\n"
+disc << "Author: #{pr_data.dig('author', 'login')}\n"
+disc << "URL: #{url}\nBase: #{base}\nHead: #{head}\n"
+disc << section('DESCRIPTION')
+disc << (pr_data['body'].to_s.empty? ? '(no description)' : pr_data['body'])
+
+disc << section('ISSUE COMMENTS')
+(pr_data['comments'] || []).each do |c|
+  disc << "--- #{c.dig('author', 'login')} (#{c['createdAt']}) ---\n#{c['body']}\n\n"
+end
+
+disc << section('REVIEWS')
+(pr_data['reviews'] || []).each do |r|
+  disc << "--- #{r.dig('author', 'login')} [#{r['state']}] (#{r['submittedAt']}) ---\n#{r['body']}\n\n"
+end
+
+disc << section('REVIEW THREAD COMMENTS')
+rc_raw = nil
+IO.popen(['gh', 'api', "repos/#{source}/pulls/#{pr}/comments", '--paginate']) { |io| rc_raw = io.read }
+if $?.success?
+  begin
+    JSON.parse(rc_raw).each do |c|
+      disc << "--- #{c.dig('user', 'login')} on #{c['path']}:#{c['line'] || c['original_line']} ---\n#{c['body']}\n\n"
+    end
+  rescue JSON::ParserError
+    disc << "(could not parse review thread comments)\n"
+  end
+else
+  disc << "(review thread comments unavailable)\n"
+end
+
+FileUtils.mkdir_p(review_dir)
+File.write(File.join(review_dir, 'discussion.txt'), disc)
+
+# version = max existing findings/<topic>/v* + 1
+existing = Dir.glob(File.join(project_dir, 'findings', canonical, 'v*'))
+                .map { |p| p[/v(\d+)\z/, 1]&.to_i }.compact
+version = (existing.max || 0) + 1
+
+metadata = {
+  'project'     => config['name'],
+  'topic'       => canonical,
+  'version'     => version,
+  'source_url'  => url,
+  'base_branch' => base,
+  'pr_number'   => pr.to_i,
+  'head_sha'    => head,
+}
+File.write(File.join(review_dir, 'metadata.json'), JSON.pretty_generate(metadata) + "\n")
+puts "github-pr: wrote #{File.join(review_dir, 'metadata.json')} (version #{version}, base #{base})"

@@ -1,0 +1,2 @@
+PR #5: Add frobnicator
+Reviewer asked about thread safety of the frobnicator.

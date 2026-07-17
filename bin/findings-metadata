@@ -1,0 +1,214 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Writes normalized metadata.json into findings/<topic>/vNN/ so review
+# metadata is committed with the findings (the review/ worktrees holding the
+# original metadata are gitignored). Used by the web frontend indexer.
+#
+# Usage:
+#   findings-metadata --project <project.yaml> <topic>   # current version of one topic
+#   findings-metadata --backfill                         # fill all missing, all projects
+#   findings-metadata --backfill-titles                  # fetch missing titles into existing files
+
+require 'json'
+require 'yaml'
+require 'time'
+require 'open3'
+require 'net/http'
+require 'cgi'
+
+class FindingsMetadata
+  def initialize(base_dir:, now: nil, http: nil)
+    @base_dir = File.expand_path(base_dir)
+    @now = now
+    @http = http
+  end
+
+  def write_topic(project_yaml, topic)
+    project_dir = File.expand_path(File.dirname(project_yaml))
+    config = YAML.safe_load_file(project_yaml)
+    project = config['name'] || File.basename(project_dir)
+    sources = collect_sources(project_dir, config, topic)
+    version = sources['version']
+    return warn_skip("#{topic}: no version in review metadata") unless version
+
+    vdir = File.join(project_dir, 'findings', topic, "v#{version}")
+    return warn_skip("#{topic}: findings dir #{vdir} missing") unless Dir.exist?(vdir)
+
+    write_version_dir(vdir, project, topic, version.to_i, sources)
+  end
+
+  def backfill
+    count = 0
+    Dir.glob(File.join(@base_dir, '*', 'project.yaml')).sort.each do |yaml|
+      project_dir = File.dirname(yaml)
+      config = YAML.safe_load_file(yaml)
+      project = config['name'] || File.basename(project_dir)
+      Dir.glob(File.join(project_dir, 'findings', '*', 'v*')).sort.each do |vdir|
+        next unless File.basename(vdir) =~ /\Av(\d+)\z/
+
+        version = Regexp.last_match(1).to_i
+        next if File.exist?(File.join(vdir, 'metadata.json'))
+
+        topic = File.basename(File.dirname(vdir))
+        sources = collect_sources(project_dir, config, topic)
+        sources['reviewed_at'] = last_commit_time(vdir)
+        write_version_dir(vdir, project, topic, version, sources)
+        count += 1
+      end
+    end
+    puts "backfill: wrote #{count} metadata files"
+    count
+  end
+
+  # fill 'title' into already-written metadata files by fetching the thread page
+  def backfill_titles
+    count = 0
+    cache = {}
+    Dir.glob(File.join(@base_dir, '*', 'findings', '*', 'v*', 'metadata.json')).sort.each do |path|
+      data = read_json(path)
+      next if data['title'] && !data['title'].empty?
+
+      url = data['hackorum_url'] || data['source_url']
+      next warn_skip("#{path}: no url to fetch title from") unless url
+
+      title = cache.key?(url) ? cache[url] : (cache[url] = fetch_title(url))
+      next warn_skip("#{path}: no title from #{url}") unless title
+
+      data['title'] = title
+      File.write(path, JSON.pretty_generate(canonical(data)) + "\n")
+      puts "backfill-titles: #{path}: #{title}"
+      count += 1
+    end
+    puts "backfill-titles: wrote #{count} metadata files"
+    count
+  end
+
+  private
+
+  KEY_ORDER = %w[project topic version title source_url hackorum_url reviewed_at].freeze
+
+  def canonical(data)
+    ordered = KEY_ORDER.each_with_object({}) { |k, h| h[k] = data[k] unless data[k].nil? }
+    ordered.merge(data.reject { |k, _| KEY_ORDER.include?(k) })
+  end
+
+  def fetch_title(url)
+    body = @http ? @http.call(url) : fetch_page(url)
+    body && title_from_html(body)
+  end
+
+  def title_from_html(body)
+    m = body.match(%r{<title>(.*?)</title>}m)
+    return nil unless m
+
+    # hackorum double-escapes entities, unescape twice
+    title = CGI.unescapeHTML(CGI.unescapeHTML(m[1])).gsub(/\s+/, ' ').strip
+    title = title.sub(/\APostgreSQL:\s*/, '').sub(/\s*-\s*Hackorum\z/, '')
+    title.empty? ? nil : title
+  end
+
+  def fetch_page(url, limit = 5)
+    return nil if limit.zero?
+
+    res = Net::HTTP.get_response(URI(url))
+    case res
+    when Net::HTTPRedirection then fetch_page(URI.join(url, res['location']).to_s, limit - 1)
+    when Net::HTTPSuccess then res.body
+    end
+  rescue StandardError => e
+    warn "findings-metadata: fetch failed #{url}: #{e.message}"
+    nil
+  end
+
+  def write_version_dir(vdir, project, topic, version, sources)
+    out = File.join(vdir, 'metadata.json')
+    existing = read_json(out)
+    data = {
+      'project' => project,
+      'topic' => topic,
+      'version' => version,
+      'title' => sources['title'] || title_for(vdir) || existing['title'],
+      'source_url' => sources['source_url'] || existing['source_url'],
+      'hackorum_url' => sources['hackorum_url'] || existing['hackorum_url'],
+      'reviewed_at' => existing['reviewed_at'] || sources['reviewed_at'] || now_iso
+    }.compact
+    File.write(out, JSON.pretty_generate(data) + "\n")
+    puts "findings-metadata: wrote #{out}"
+    out
+  end
+
+  def collect_sources(project_dir, config, topic)
+    review_dir = File.join(project_dir, 'review', topic)
+    norm = read_json(File.join(review_dir, 'metadata.json'))
+    hack = read_json(File.join(review_dir, '.hackorum', 'metadata.json'))
+    {
+      'version' => norm['version'],
+      'title' => norm['title'],
+      'source_url' => norm['source_url'] || hack['upstream_url'] || pr_url(config, topic),
+      'hackorum_url' => hack['hackorum_url']
+    }
+  end
+
+  def pr_url(config, topic)
+    source = config['source']
+    prefix = config['topic_prefix'] || 'pr'
+    return nil unless source && topic =~ /\A#{Regexp.escape(prefix)}(\d+)\z/
+
+    "https://github.com/#{source}/pull/#{Regexp.last_match(1)}"
+  end
+
+  def title_for(vdir)
+    disc = File.join(vdir, 'discussion.txt')
+    if File.exist?(disc)
+      first = File.open(disc) { |f| f.gets }.to_s
+      return Regexp.last_match(1).strip if first =~ /\APR #\d+:\s*(.+)/
+    end
+    overview = File.join(vdir, '00-overview.md')
+    return nil unless File.exist?(overview)
+
+    File.foreach(overview) do |line|
+      next unless line =~ /\A#\s+(.+)/
+
+      heading = Regexp.last_match(1).strip
+      return heading =~ /\A(Patch|PR) Overview/ ? nil : heading
+    end
+    nil
+  end
+
+  def last_commit_time(path)
+    rel = path.sub(%r{\A#{Regexp.escape(@base_dir)}/}, '')
+    out, status = Open3.capture2('git', '-C', @base_dir, 'log', '-1', '--format=%cI', '--', rel)
+    status.success? && !out.strip.empty? ? out.strip : nil
+  end
+
+  def read_json(path)
+    return {} unless File.exist?(path)
+
+    JSON.parse(File.read(path))
+  rescue JSON::ParserError
+    {}
+  end
+
+  def now_iso = (@now || Time.now).utc.iso8601
+
+  def warn_skip(msg)
+    warn "findings-metadata: skip #{msg}"
+    nil
+  end
+end
+
+if __FILE__ == $0
+  base_dir = File.expand_path(ENV['WORKSPACE_DIR'] || File.expand_path('../workspace', __dir__))
+  if ARGV.include?('--backfill')
+    FindingsMetadata.new(base_dir: base_dir).backfill
+  elsif ARGV.include?('--backfill-titles')
+    FindingsMetadata.new(base_dir: base_dir).backfill_titles
+  else
+    idx = ARGV.index('--project')
+    unless idx && ARGV[idx + 1] && ARGV[idx + 2]
+      abort 'usage: findings-metadata --project <project.yaml> <topic> | --backfill | --backfill-titles'
+    end
+    exit 1 unless FindingsMetadata.new(base_dir: base_dir).write_topic(ARGV[idx + 1], ARGV[idx + 2])
+  end
+end

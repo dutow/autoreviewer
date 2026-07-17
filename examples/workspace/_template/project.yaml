@@ -1,0 +1,34 @@
+# Template project config. For a GitHub-PR project, run
+# `task new-project NAME=<name>` - it copies this directory to <name>/ and
+# generates .claude/commands/<name>/review-patch.md from the _git-pr spine.
+# For a mailing-list-style project, copy this directory by hand and create
+# .claude/commands/<name>/review-patch.md from
+# .claude/commands/_template/review-patch.md instead.
+name: CHANGEME
+# source: owner/repo        # GitHub-PR projects only - required by bin/github-pr
+# topic_prefix: pr           # GitHub-PR projects only - default topic_prefix is 't'
+base_branch: main          # branch patches are diffed/built against
+
+ingestion:
+  # Name of an ingestion hook: a script in this project dir OR in bin/.
+  # Must populate <name>/review/<topic>/ with patch files and a
+  # normalized metadata.json (project, topic, version, source_url, base_branch).
+  hook: github-pr          # shared infra hook (bin/github-pr)
+  # hook: ingest   # mailing-list style - see postgres/ingest for a wrapper example
+
+build:
+  # Name of a build hook (project dir or bin/). Invoked:
+  #   <hook> --project <project.yaml> <topic> <config>
+  hook: CHANGEME
+  default_config: CHANGEME
+  queue_configs:
+    - CHANGEME
+
+review:
+  command: CHANGEME:review-patch
+
+# Optional: auto-poll open PRs for this project while review-queue runs.
+# Only meaningful for GitHub-PR projects (those with a `source: owner/repo`).
+# When enabled, bin/review-poll enqueues any open PR whose head commit changed.
+# poll:
+#   enabled: true

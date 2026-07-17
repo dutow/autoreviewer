@@ -1,0 +1,62 @@
+.viewer
+  nav.side
+    .topic-head
+      = @version.topic_name
+      small
+        = @version.project_name
+        - if @meta["title"]
+          = " · #{@meta["title"]}"
+    - if @toc.any?
+      details.toc[open data-key="sections"]
+        summary Sections
+        ul
+          - @toc.each do |e|
+            li = link_to e[:text], "##{e[:id]}", class: "lvl#{e[:level]}"
+    details.files[open data-key="files"]
+      summary = "Files — v#{@version.number}"
+      ul
+        - top, nested = @files.partition { |f| !f.relpath.include?("/") }
+        - top.each do |f|
+          li = link_to "#{file_icon(f.kind)} #{f.relpath}", finding_file_path(@version.project_name, @version.topic_name, @version.number, f.relpath), class: ("active" if f.relpath == @file.relpath)
+        - nested.group_by { |f| File.dirname(f.relpath) }.sort.each do |dir, fs|
+          li.dir = "📁 #{dir}/"
+          - fs.each do |f|
+            li.indent = link_to "#{file_icon(f.kind)} #{File.basename(f.relpath)}", finding_file_path(@version.project_name, @version.topic_name, @version.number, f.relpath), class: ("active" if f.relpath == @file.relpath)
+    details.versions[open data-key="versions"]
+      summary Versions
+      ul
+        - @versions.reverse_each do |v|
+          li
+            = link_to version_path(@version.project_name, @version.topic_name, v.number), class: ("active" if v.number == @version.number) do
+              = "v#{v.number}"
+              - if v.number == @version.number
+                span.badge viewing
+              - if (d = short_date(v.metadata["reviewed_at"]))
+                span.ver-date = d
+  .main
+    nav.crumbs
+      = link_to @version.project_name, project_path(@version.project_name)
+      span.sep /
+      = link_to @version.topic_name, topic_path(@version.project_name, @version.topic_name)
+      span.sep /
+      = "v#{@version.number}"
+      span.sep /
+      span = @file.relpath
+      span.sep ·
+      = link_to "raw", finding_file_path(@version.project_name, @version.topic_name, @version.number, @file.relpath, raw: 1)
+      - if (u = safe_url(@meta["source_url"]))
+        span.sep ·
+        = link_to "discussion ↗", u
+      - if (u = safe_url(@meta["hackorum_url"]))
+        span.sep ·
+        = link_to "hackorum ↗", u
+    - case @file.kind
+    - when "markdown"
+      article.markdown == @content_html
+    - when "patch"
+      == @content_html
+    - else
+      - if @content_html
+        == @content_html
+      - else
+        pre.plain = @plain_text

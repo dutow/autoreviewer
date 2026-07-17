@@ -1,0 +1,391 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'open3'
+require 'shellwords'
+require 'fileutils'
+require 'json'
+require 'yaml'
+
+$stdout.sync = true
+
+class ReviewQueue
+  GRACE_SECONDS = 120
+
+  def initialize
+    @base_dir = File.expand_path('..', __dir__)
+    @workspace_dir = File.expand_path(env_or('WORKSPACE_DIR', File.join(@base_dir, 'workspace')))
+    @state_dir = File.expand_path(env_or('STATE_DIR', File.join(@base_dir, 'state')))
+    @queue_file = env_or('REVIEW_QUEUE_FILE', File.join(@state_dir, 'queue'))
+    @processed_file = env_or('REVIEW_QUEUE_PROCESSED', File.join(@state_dir, 'queue.processed'))
+    @projects_dir = @workspace_dir
+    @dry_run = !ENV['REVIEW_QUEUE_DRYRUN'].to_s.empty?
+    @running = true
+  end
+
+  def run
+    ok = preflight
+    abort 'preflight failed' unless @dry_run || ok
+    ensure_tmux! unless @dry_run
+    spawn_poller unless @dry_run
+    setup_signal_handlers
+
+    puts "=== Review Queue Orchestrator ==="
+    puts "Queue file: #{@queue_file}"
+    puts "Waiting for topics..."
+    puts ""
+
+    check_command_drift
+
+    while @running
+      topic_id = next_topic
+      if topic_id
+        begin
+          process_topic(topic_id)
+        rescue StandardError => e
+          puts "[#{timestamp}] WARNING: topic failed: #{e.message}"
+        end
+        mark_processed unless @dry_run
+      else
+        sleep 3
+      end
+    end
+  end
+
+  private
+
+  def env_or(name, default)
+    v = ENV[name].to_s
+    v.empty? ? default : v
+  end
+
+  def parse_entry(line)
+    parts = line.split
+    if parts[1] == 'commits'
+      return parts.size == 3 ? [parts[0], :commits, parts[2]] : [parts[0], :invalid, line]
+    end
+
+    if parts.size == 1 && parts[0].match?(/\A\d+\z/)
+      default = ENV['DEFAULT_PROJECT'].to_s
+      return [nil, :invalid, "bare topic '#{parts[0]}' needs DEFAULT_PROJECT set"] if default.empty?
+      [default, :topic, "#{topic_prefix_for(default)}#{parts[0]}"]
+    else
+      project = parts[0]
+      topic = parts[1].to_s
+      topic = "#{topic_prefix_for(project)}#{topic}" if topic.match?(/\A\d+\z/)
+      [project, :topic, topic]
+    end
+  end
+
+  def topic_prefix_for(project)
+    yaml = File.join(@projects_dir, project, 'project.yaml')
+    return 't' unless File.exist?(yaml)
+    cfg = YAML.safe_load_file(yaml)
+    (cfg && cfg['topic_prefix']) || 't'
+  rescue StandardError
+    't'
+  end
+
+  def load_project(project)
+    yaml = File.join(@projects_dir, project, 'project.yaml')
+    raise "project.yaml not found: #{yaml}" unless File.exist?(yaml)
+    [YAML.safe_load_file(yaml), yaml, File.dirname(yaml)]
+  end
+
+  def resolve_hook(project_dir, name)
+    [File.join(project_dir, name),
+     File.join(@workspace_dir, 'bin', name),
+     File.join(@base_dir, 'bin', name)].each do |path|
+      return path if File.executable?(path)
+    end
+    raise "hook '#{name}' not found in #{project_dir}, workspace/bin, or bin/"
+  end
+
+  def ensure_tmux!
+    return if ENV['TMUX']
+
+    puts "Not running inside tmux. Starting tmux session 'reviews'..."
+    exec('tmux', 'new-session', '-s', 'reviews', '-n', 'orchestrator', '--', $0)
+  end
+
+  def any_poll_enabled?
+    Dir.glob(File.join(@projects_dir, '*', 'project.yaml')).any? do |yaml|
+      cfg = YAML.safe_load_file(yaml)
+      # base_branch, not source: refresh-only and commit-review projects need the poller too
+      cfg && cfg.dig('poll', 'enabled') && cfg['base_branch']
+    rescue StandardError
+      false
+    end
+  end
+
+  def poller_window_exists?
+    out = `tmux list-windows -t reviews -F '#W' 2>/dev/null`
+    out.split("\n").include?('poller')
+  end
+
+  def spawn_poller
+    return unless any_poll_enabled?
+    if poller_window_exists?
+      puts "[#{timestamp}] PR poller window already running; not spawning."
+      return
+    end
+    poller = File.join(@base_dir, 'bin', 'review-poll')
+    unless File.executable?(poller)
+      puts "[#{timestamp}] WARNING: #{poller} not found or not executable; skipping poller"
+      return
+    end
+    puts "[#{timestamp}] Starting PR poller in tmux window 'poller'..."
+    ok = system('tmux', 'new-window', '-n', 'poller', '-d',
+                "cd #{Shellwords.escape(@base_dir)} && #{Shellwords.escape(poller)}")
+    puts "[#{timestamp}] WARNING: failed to spawn poller window" unless ok
+  end
+
+  def setup_signal_handlers
+    Signal.trap('INT') do
+      puts "\nShutting down..."
+      @running = false
+    end
+
+    Signal.trap('TERM') do
+      @running = false
+    end
+  end
+
+  # Runs synchronously at startup: bin/check-command-drift must stay fast and non-interactive.
+  def check_command_drift
+    script = File.join(@base_dir, 'bin', 'check-command-drift')
+    return unless File.executable?(script)
+
+    out, status = Open3.capture2e(script)
+    return if status.success?
+
+    puts "[#{timestamp}] WARNING: review command drift detected (bin/check-command-drift):"
+    puts out
+    puts ""
+  rescue => e
+    puts "[#{timestamp}] WARNING: could not run drift check: #{e.message}"
+  end
+
+  def next_topic
+    return nil unless File.exist?(@queue_file)
+
+    lines = File.readlines(@queue_file, chomp: true).reject(&:empty?)
+    offset = read_offset
+
+    return nil if offset >= lines.size
+
+    lines[offset]
+  end
+
+  def mark_processed
+    offset = read_offset + 1
+    File.write(@processed_file, offset.to_s)
+  end
+
+  def read_offset
+    return 0 unless File.exist?(@processed_file)
+
+    File.read(@processed_file).strip.to_i
+  end
+
+  def timestamp
+    Time.now.strftime('%H:%M:%S')
+  end
+
+  def process_topic(line)
+    project, kind, topic = parse_entry(line)
+    if kind == :invalid
+      puts "[#{timestamp}] WARNING: skipping malformed queue entry: #{topic}"
+      return
+    end
+    return process_commit_batch(project, topic) if kind == :commits
+
+    config, yaml, project_dir = load_project(project)
+
+    ingest_hook = resolve_hook(project_dir, config.dig('ingestion', 'hook'))
+    build_hook  = resolve_hook(project_dir, config.dig('build', 'hook'))
+    configs     = config.dig('build', 'queue_configs') || [config.dig('build', 'default_config')].compact
+    command     = config.dig('review', 'command')
+
+    puts "[#{timestamp}] ═══ Processing project=#{project} topic=#{topic} ═══"
+    puts "  ingest:  #{ingest_hook} --project #{yaml} #{topic}"
+    puts "  build:   #{build_hook} --project #{yaml} #{topic} <#{configs.join(', ')}>"
+    puts "  command: /#{command} #{topic}"
+
+    if @dry_run
+      puts "  [dry-run] not executing"
+      return
+    end
+
+    unless run_hook([ingest_hook, '--project', yaml, topic], cwd: @base_dir)
+      notify_failure(topic, "ingestion hook failed")
+      return
+    end
+
+    configs.each do |cfg|
+      puts "[#{timestamp}] Building #{topic} with #{cfg}..."
+      ok = run_hook([build_hook, '--project', yaml, topic, cfg], cwd: @base_dir)
+      puts "[#{timestamp}] Build #{cfg} #{ok ? 'OK' : 'FAILED (continuing)'}"
+    end
+
+    prepare_findings_dir(project_dir, topic)
+    launch_review(project, command, topic)
+  end
+
+  def process_commit_batch(project, range)
+    config, _yaml, _project_dir = load_project(project)
+    command = config.dig('commit_review', 'command')
+
+    puts "[#{timestamp}] ═══ Processing project=#{project} commits=#{range} ═══"
+
+    unless command
+      puts "  ERROR: commit_review.command missing in project.yaml"
+      notify_failure("#{project}-commits", 'commit_review.command missing in project.yaml') unless @dry_run
+      return
+    end
+
+    puts "  command: /#{command} #{range}"
+
+    if @dry_run
+      puts "  [dry-run] not executing"
+      return
+    end
+
+    from, to = range.split('..')
+    window = "#{project}-commits-#{from[0, 7]}-#{to.to_s[0, 7]}"
+    launch_review(project, command, range, window_name: window)
+  end
+
+  def run_hook(cmd, cwd:)
+    success = false
+    Open3.popen2e(*cmd, chdir: cwd) do |_stdin, out, wait_thr|
+      out.each_line { |l| print "  #{l}" }
+      success = wait_thr.value.success?
+    end
+    success
+  end
+
+  def notify_failure(topic, message)
+    window_name = "FAIL-#{topic}"
+    error_text = "#{message}\n\n#{@last_failure_output}"
+
+    system(
+      'tmux', 'new-window', '-n', window_name, '-d',
+      "echo #{Shellwords.escape(error_text)}; echo ''; echo 'Press Enter to close...'; read"
+    )
+
+    puts "[#{timestamp}] Failure notification created in tmux window '#{window_name}'"
+  end
+
+  def prepare_findings_dir(project_dir, topic)
+    meta_file = File.join(project_dir, 'review', topic, 'metadata.json')
+    unless File.exist?(meta_file)
+      puts "[#{timestamp}] WARNING: #{meta_file} not found; leaving findings dir to Claude"
+      return nil
+    end
+    version = JSON.parse(File.read(meta_file))['version']
+    if version.nil?
+      puts "[#{timestamp}] WARNING: version missing in metadata; leaving findings dir to Claude"
+      return nil
+    end
+
+    rel = File.join('findings', topic, "v#{version}")
+    abs = File.join(project_dir, rel)
+    FileUtils.mkdir_p(abs)
+
+    current = File.join(project_dir, 'current-reviews')
+    FileUtils.mkdir_p(current)
+    link = File.join(current, topic)
+    FileUtils.rm_f(link) if File.symlink?(link) || File.exist?(link)
+    File.symlink(File.join('..', rel), link)
+    puts "[#{timestamp}] Findings dir ready: #{rel}"
+
+    meta_cmd = [File.join(@base_dir, 'bin', 'findings-metadata'),
+                '--project', File.join(project_dir, 'project.yaml'), topic]
+    puts "[#{timestamp}] WARNING: findings-metadata failed (continuing)" unless system(*meta_cmd)
+
+    rel
+  rescue => e
+    puts "[#{timestamp}] WARNING: could not prepare findings dir: #{e.message}"
+    nil
+  end
+
+  def launch_review(project, command, topic, window_name: "#{project}-#{topic}")
+    signal = File.join(@state_dir, 'signals', "#{window_name}.done")
+    FileUtils.mkdir_p(File.dirname(signal))
+    FileUtils.rm_f(signal)
+
+    puts "[#{timestamp}] Launching Claude review in tmux window '#{window_name}'..."
+    claude_cmd = "REVIEW_DONE_FILE=#{Shellwords.escape(signal)} " \
+                 "claude --model opus --dangerously-skip-permissions -n #{Shellwords.escape(window_name)} " \
+                 "-- #{Shellwords.escape("/#{command} #{topic}")}"
+    system('tmux', 'new-window', '-n', window_name, '-d',
+           "cd #{Shellwords.escape(@workspace_dir)} && #{claude_cmd}")
+    spawn_watcher(signal, window_name)
+    puts "[#{timestamp}] Review session started in window '#{window_name}' (auto-close armed)"
+  end
+
+  def spawn_watcher(signal, window_name)
+    push_line = ENV['AUTO_PUSH'] == '1' ? "#{Shellwords.escape(File.join(@base_dir, 'bin', 'review-push'))} #{Shellwords.escape(window_name)}" : ": # AUTO_PUSH disabled"
+    script = <<~SH
+      while [ ! -e #{Shellwords.escape(signal)} ]; do sleep 2; done
+      #{push_line}
+      sleep #{GRACE_SECONDS}
+      # Re-check: a re-queued same-topic review rm -f's the sentinel on relaunch,
+      # so a stale watcher skips the kill instead of closing the new window.
+      [ -e #{Shellwords.escape(signal)} ] && tmux kill-window -t #{Shellwords.escape("reviews:#{window_name}")} 2>/dev/null
+    SH
+    pid = Process.spawn('bash', '-c', script, %i[out err] => File::NULL)
+    Process.detach(pid)
+  rescue => e
+    puts "[#{timestamp}] WARNING: could not spawn auto-close watcher: #{e.message}"
+  end
+
+  def preflight
+    checks = []
+    checks << ['workspace exists', File.directory?(@workspace_dir),
+               "missing #{@workspace_dir} - run 'task init-workspace' or clone your workspace repo there"]
+    checks << ['workspace is a git repo', File.exist?(File.join(@workspace_dir, '.git')),
+               "#{@workspace_dir} is not a git repo"]
+    checks << ['tmux available', system('tmux -V > /dev/null 2>&1'), 'tmux not found on PATH']
+    state_ok = begin
+      FileUtils.mkdir_p(@state_dir)
+      File.writable?(@state_dir)
+    rescue StandardError
+      false
+    end
+    checks << ['state dir writable', state_ok, "cannot write #{@state_dir}"]
+    claude_ok = system('command -v claude > /dev/null 2>&1') &&
+                (File.exist?(File.expand_path(File.join(env_or('CLAUDE_CONFIG_DIR', '~/.claude'), '.credentials.json'))) ||
+                 !ENV['ANTHROPIC_API_KEY'].to_s.empty?)
+    checks << ['claude authenticated', claude_ok, "claude CLI missing or not logged in - run 'task login'"]
+
+    failed = false
+    checks.each do |name, ok, msg|
+      puts ok ? "OK   #{name}" : "FAIL #{name}: #{msg}"
+      failed ||= !ok
+    end
+    if ENV['AUTO_PUSH'] == '1'
+      remote_ok = system('git', '-C', @workspace_dir, 'remote', 'get-url', 'origin',
+                         out: File::NULL, err: File::NULL)
+      puts "WARN AUTO_PUSH=1 but workspace has no 'origin' remote" unless remote_ok
+    end
+    !failed
+  end
+end
+
+if __FILE__ == $0
+  if ARGV.include?('--check')
+    exit(ReviewQueue.new.send(:preflight) ? 0 : 1)
+  end
+
+  begin
+    ReviewQueue.new.run
+  rescue Interrupt
+    puts "\n\nInterrupted by user"
+    exit 130
+  rescue => e
+    puts "\nERROR: #{e.message}"
+    exit 1
+  end
+end

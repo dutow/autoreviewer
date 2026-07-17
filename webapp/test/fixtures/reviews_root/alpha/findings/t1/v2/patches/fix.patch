@@ -1,0 +1,8 @@
+--- a/src/foo_bar.c
++++ b/src/foo_bar.c
+@@ -10,4 +10,5 @@ int foo_bar(char *s)
+ int foo_bar(char *s)
+ {
++    if (s == NULL) return -1;
+     return strlen(s);
+ }

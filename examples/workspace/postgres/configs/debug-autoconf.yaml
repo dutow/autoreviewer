@@ -1,0 +1,11 @@
+build_system: autoconf
+build_args:
+  - --enable-cassert
+  - --enable-tap-tests
+  - --enable-debug
+  - --enable-injection-points
+  - --without-icu
+run_tests: true
+test_command: check-world
+install: true
+jobs: null

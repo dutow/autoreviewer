@@ -1,0 +1,64 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Checks that each GitHub-PR project's review-patch command matches the
+# _git-pr template outside the marked project-specific regions.
+# Exit 0 when clean, 1 when any project drifted.
+
+require 'tempfile'
+require 'yaml'
+
+BASE = File.expand_path('..', __dir__)
+WORKSPACE = File.expand_path(ENV['WORKSPACE_DIR'] || File.join(BASE, 'workspace'))
+TEMPLATE = File.join(WORKSPACE, '.claude/commands/_git-pr/review-patch.md')
+unless File.exist?(TEMPLATE)
+  puts 'drift check skipped: no _git-pr template in workspace'
+  exit 0
+end
+PROJECTS = Dir.glob(File.join(WORKSPACE, '*', 'project.yaml')).sort.filter_map do |yaml|
+  next if File.basename(File.dirname(yaml)).start_with?('_')
+
+  cfg = begin
+    YAML.safe_load_file(yaml)
+  rescue StandardError
+    nil
+  end
+  cfg['name'] if cfg.is_a?(Hash) && cfg.dig('ingestion', 'hook') == 'github-pr'
+end
+MARKED = /^<!-- project-specific:start -->$.*?^<!-- project-specific:end -->$\n?/m
+
+def spine(text)
+  text.gsub(MARKED, "<<project-specific>>\n")
+end
+
+template = File.read(TEMPLATE)
+drifted = false
+
+PROJECTS.each do |proj|
+  cmd_path = File.join(WORKSPACE, '.claude/commands', proj, 'review-patch.md')
+  unless File.exist?(cmd_path)
+    warn "#{proj}: MISSING #{cmd_path}"
+    drifted = true
+    next
+  end
+
+  expected = spine(template.gsub('<PROJECT>', proj))
+  actual = spine(File.read(cmd_path))
+
+  if expected == actual
+    puts "#{proj}: OK"
+  else
+    drifted = true
+    puts "#{proj}: DRIFT"
+    a = Tempfile.new(['expected', '.md'])
+    a.write(expected)
+    a.close
+    b = Tempfile.new(['actual', '.md'])
+    b.write(actual)
+    b.close
+    system('diff', '-u', '--label', "template(#{proj})", '--label', cmd_path, a.path, b.path)
+    File.unlink(a.path, b.path)
+  end
+end
+
+exit(drifted ? 1 : 0)

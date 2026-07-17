@@ -1,0 +1,90 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'fileutils'
+
+def env_or(name, default)
+  v = ENV[name].to_s
+  v.empty? ? default : v
+end
+
+base_dir = File.expand_path('..', __dir__)
+workspace_dir = File.expand_path(env_or('WORKSPACE_DIR', File.join(base_dir, 'workspace')))
+state_dir = File.expand_path(env_or('STATE_DIR', File.join(base_dir, 'state')))
+queue_file = env_or('REVIEW_QUEUE_FILE', File.join(state_dir, 'queue'))
+projects_dir = workspace_dir
+
+if ARGV.empty?
+  puts "Usage: enqueue [project] <topic> [topic ...]"
+  puts ""
+  puts "Adds topics to the review queue. If the first argument names a"
+  puts "project directory in the workspace, it is the project; otherwise the project"
+  puts "defaults to \$DEFAULT_PROJECT (error if unset). Numeric topics get the project's topic_prefix (default 't'; git-PR projects use 'pr')."
+  puts "Examples:"
+  puts "  enqueue 49610            -> \$DEFAULT_PROJECT t49610"
+  puts "  enqueue postgres t49610  -> postgres t49610"
+  puts "  enqueue pg_tde 123       -> pg_tde pr123  (if topic_prefix: pr)"
+  puts "  enqueue [project] commits <from>..<to> -> commit review batch"
+  exit 1
+end
+
+args = ARGV.dup
+project = ENV['DEFAULT_PROJECT'].to_s
+if File.directory?(File.join(projects_dir, args.first))
+  project = args.shift
+end
+
+if args.empty?
+  puts "ERROR: no topics given"
+  exit 1
+end
+
+if project.empty?
+  puts "ERROR: no project given and DEFAULT_PROJECT not set"
+  exit 1
+end
+
+unless File.directory?(File.join(projects_dir, project))
+  puts "ERROR: project '#{project}' not found in #{projects_dir}"
+  exit 1
+end
+
+FileUtils.mkdir_p(state_dir)
+
+# 'commits' is reserved as a form keyword; a project literally named
+# 'commits' must be given explicitly: enqueue commits commits <range>
+if args.first == 'commits'
+  range = args[1]&.downcase
+  unless args.size == 2 && range&.match?(/\A[0-9a-f]{7,40}\.\.[0-9a-f]{7,40}\z/)
+    puts "ERROR: usage: enqueue [project] commits <from>..<to> (hex shas)"
+    exit 1
+  end
+  File.open(queue_file, 'a') { |f| f.puts("#{project} commits #{range}") }
+  puts "Queued: #{project} commits #{range}"
+  exit 0
+end
+
+require 'yaml'
+prefix = 't'
+yaml = File.join(projects_dir, project, 'project.yaml')
+if File.exist?(yaml)
+  begin
+    cfg = YAML.safe_load_file(yaml)
+    prefix = cfg['topic_prefix'] if cfg && cfg['topic_prefix']
+  rescue StandardError => e
+    puts "WARNING: could not parse #{yaml}: #{e.message}"
+  end
+end
+
+allowed_prefixes = ['t', 'pr', prefix].uniq.map { |p| Regexp.escape(p) }
+topic_re = /\A(?:#{allowed_prefixes.join('|')})[\w.-]+\z/
+
+args.each do |raw|
+  topic = raw.match?(/\A\d+\z/) ? "#{prefix}#{raw}" : raw
+  unless topic.match?(topic_re)
+    puts "ERROR: '#{raw}' is not a valid topic"
+    exit 1
+  end
+  File.open(queue_file, 'a') { |f| f.puts("#{project} #{topic}") }
+  puts "Queued: #{project} #{topic}"
+end

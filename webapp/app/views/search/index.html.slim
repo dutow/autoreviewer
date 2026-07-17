@@ -1,0 +1,12 @@
+.page
+  h1 Search
+  - if @q.present?
+    p = "#{@hits.size} result(s) for “#{@q}”"
+    ul.results
+      - @hits.each do |hit|
+        - doc = hit[:document]
+        - rv = doc.review_version
+        li.hit
+          = link_to "#{rv.project}/#{rv.topic} v#{rv.version} — #{doc.relpath}",
+                    finding_file_path(rv.project, rv.topic, rv.version, doc.relpath)
+          p.snippet == snippet_html(hit[:snippet])

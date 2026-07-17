@@ -1,0 +1,38 @@
+# postgres — upstream PostgreSQL review project.
+name: postgres
+base_branch: master
+
+# Upstream to clone into master/ on first setup: task init-master PROJ=postgres.
+# Only mailing-list projects need this; github-pr projects create master/ at ingest.
+clone_url: https://git.postgresql.org/git/postgresql.git
+
+# Ingestion: thin wrapper around the external bin/hackorum-patch.
+# Resolved local-then-global; invoked as: <hook> --project <this file> <topic>
+ingestion:
+  hook: ingest
+
+# Build hook (our pg-build, project-aware).
+# Invoked as: <hook> --project <this file> <topic> <config>
+build:
+  hook: pg-build
+  default_config: debug-meson
+  # Configs the queue orchestrator builds for each topic:
+  queue_configs:
+    - debug-meson
+    - debug-autoconf
+
+# Per-project review command, invoked as /<command> <topic>.
+review:
+  command: postgres:review-patch
+
+# Poll: no source (not a GitHub-PR project), so this is refresh-only —
+# review-poll fast-forwards the master checkout to origin/master each cycle.
+poll:
+  enabled: true
+
+# Commit review: lightweight triage of new base_branch commits, batched
+# off-hours by the poller. See .claude/commands/postgres/review-commits.md.
+commit_review:
+  command: postgres:review-commits
+  window: "02:00-05:00"
+  max_batch: 10

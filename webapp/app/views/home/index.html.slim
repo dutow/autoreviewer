@@ -1,0 +1,11 @@
+.page
+  h1 All reviews
+  nav.filters
+    = link_to "all", root_path(params.permit(:versions).to_h), class: params[:project].blank? ? "active" : nil
+    - @projects.each do |p|
+      = link_to p, root_path(params.permit(:versions).to_h.merge(project: p)), class: params[:project] == p ? "active" : nil
+  = render "shared/version_toggle",
+      latest_url: root_path(params.permit(:project).to_h),
+      all_url: root_path(params.permit(:project).to_h.merge(versions: "all"))
+  = render "shared/review_table", reviews: @reviews
+  = render "shared/pager"

@@ -1,0 +1,3 @@
+nav.filters.versions
+  = link_to "latest", latest_url, class: params[:versions] == "all" ? nil : "active"
+  = link_to "all versions", all_url, class: params[:versions] == "all" ? "active" : nil

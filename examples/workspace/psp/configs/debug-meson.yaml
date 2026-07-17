@@ -1,0 +1,10 @@
+build_system: meson
+build_args:
+  - -Dcassert=true
+  - -Dtap_tests=enabled
+  - -Dbuildtype=debug
+  - -Dinjection_points=true
+run_tests: true
+test_args: []
+install: true
+jobs: null
