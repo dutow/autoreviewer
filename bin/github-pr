@@ -37,7 +37,16 @@ abort 'ERROR: gh is not authenticated (run `gh auth login` or set GH_TOKEN)' \
   unless system('gh', 'auth', 'status', out: File::NULL, err: File::NULL)
 
 master = File.join(project_dir, 'master')
-abort "ERROR: master checkout not found: #{master}" unless File.directory?(master)
+unless File.directory?(master)
+  # master/ is gitignored, so a fresh checkout / rebuilt container has none.
+  # github-pr projects bootstrap it here (no clone_url, so init-master skips
+  # them); clone the source so origin is set for the fetches below.
+  remote = "https://github.com/#{source}.git"
+  puts "github-pr: master checkout missing, cloning #{remote} -> #{master}"
+  FileUtils.mkdir_p(File.dirname(master))
+  system('git', 'clone', remote, master) ||
+    abort("ERROR: could not clone #{remote} into #{master}")
+end
 
 puts "github-pr: fetching PR ##{pr} metadata from #{source}"
 fields = 'baseRefName,url,headRefOid,title,body,author,comments,reviews'
@@ -115,6 +124,7 @@ metadata = {
   'project'     => config['name'],
   'topic'       => canonical,
   'version'     => version,
+  'title'       => pr_data['title'],
   'source_url'  => url,
   'base_branch' => base,
   'pr_number'   => pr.to_i,
