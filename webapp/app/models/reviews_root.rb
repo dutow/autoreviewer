@@ -1,7 +1,8 @@
 require "open3"
 
 class ReviewsRoot
-  NAME_RE = /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
+  NAME_SEGMENT = /[A-Za-z0-9][A-Za-z0-9._-]*/
+  NAME_RE = /\A#{NAME_SEGMENT}\z/
 
   attr_reader :path
 

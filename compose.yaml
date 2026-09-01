@@ -34,6 +34,10 @@ services:
     stdin_open: true
     init: true
     stop_grace_period: 30s
+    # postgres tests keep DSM segments in /dev/shm; the 64m container default
+    # runs out under parallel meson test. tmpfs is allocated lazily, so a big
+    # limit costs nothing until used.
+    shm_size: ${SHM_SIZE:-2g}
     # host repo lives on a partition labeled unlabeled_t; a confined
     # container is denied getattr/read on it under SELinux MCS. disable
     # label confinement so the bind mount is accessible (dev tooling stack).

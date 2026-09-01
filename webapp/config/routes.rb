@@ -9,11 +9,14 @@ Rails.application.routes.draw do
 
   get "search" => "search#index", as: :search
 
-  get "p/:project" => "projects#show", as: :project
-  get "p/:project/t/:topic" => "topics#show", as: :topic
-  get "p/:project/t/:topic/v/:version" => "versions#show", as: :version, constraints: { version: /\d+/ }
-  get "p/:project/t/:topic/v/:version/f/*relpath" => "files#show", as: :finding_file,
-      constraints: { version: /\d+/ }, format: false
+  # default segment regexp stops at dots; project and topic names may contain them
+  constraints project: ReviewsRoot::NAME_SEGMENT, topic: ReviewsRoot::NAME_SEGMENT do
+    get "p/:project" => "projects#show", as: :project
+    get "p/:project/t/:topic" => "topics#show", as: :topic
+    get "p/:project/t/:topic/v/:version" => "versions#show", as: :version, constraints: { version: /\d+/ }
+    get "p/:project/t/:topic/v/:version/f/*relpath" => "files#show", as: :finding_file,
+        constraints: { version: /\d+/ }, format: false
+  end
 
   # Defines the root path route ("/")
   root "home#index"

@@ -196,6 +196,24 @@ class BrowseTest < ActionDispatch::IntegrationTest
     assert_select "nav.pager a[href*='versions=all']"
   end
 
+test "dotted project and topic names route" do
+  ReviewsFixture.commit_change(@reviews_dir, "beta/findings/release-2.4.0/v1/00-summary.md", "# Release 2.4.0\n")
+  ReviewsFixture.commit_change(@reviews_dir, "gamma.next/project.yaml", "name: gamma.next\n")
+  Indexer.new(root: ReviewsRoot.new(path: @reviews_dir)).run
+
+  get "/"
+  assert_select "td a[href=?]", "/p/beta/t/release-2.4.0"
+  get "/p/beta/t/release-2.4.0"
+  assert_redirected_to "/p/beta/t/release-2.4.0/v/1/f/00-summary.md"
+  follow_redirect!
+  assert_response :success
+  assert_select "article.markdown h1", text: "Release 2.4.0"
+  get "/p/beta/t/release-2.4.0/v/1"
+  assert_redirected_to "/p/beta/t/release-2.4.0/v/1/f/00-summary.md"
+  get "/p/gamma.next"
+  assert_response :success
+end
+
   private
 
   def create_bulk(n, project: "bulk")
