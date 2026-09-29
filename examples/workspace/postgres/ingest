@@ -66,9 +66,16 @@ branch = "#{canonical}_#{msgnum}"
 ref = "refs/hackorum/#{branch}"
 
 # single-ref fetch: the fork has tens of thousands of refs
+system('git', 'ls-remote', '--exit-code', BRANCH_REPO, "refs/heads/#{branch}", out: File::NULL)
+case $?.exitstatus
+when 0 then nil
+when 2 then abort "ERROR: no hackorum branch #{branch}: patch does not apply (or hackorum CI has not processed it yet)"
+else abort "ERROR: git ls-remote #{BRANCH_REPO} failed"
+end
+
 puts "ingest: fetching #{BRANCH_REPO} #{branch}"
 unless system('git', '-C', master, 'fetch', '--no-tags', BRANCH_REPO, "+refs/heads/#{branch}:#{ref}")
-  abort "ERROR: no hackorum branch #{branch}: patch does not apply (or hackorum CI has not processed it yet)"
+  abort "ERROR: git fetch of #{branch} into #{master} failed (see git output above)"
 end
 
 tip_msg = git(master, 'log', '-1', '--format=%B', ref)
