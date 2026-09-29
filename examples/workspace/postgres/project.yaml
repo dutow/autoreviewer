@@ -6,7 +6,7 @@ base_branch: master
 # Only mailing-list projects need this; github-pr projects create master/ at ingest.
 clone_url: https://git.postgresql.org/git/postgresql.git
 
-# Ingestion: thin wrapper around the external bin/hackorum-patch.
+# Ingestion: checks out the hackorum CI branch (hackorum-dev/postgres t<topic>_<msg>).
 # Resolved local-then-global; invoked as: <hook> --project <this file> <topic>
 ingestion:
   hook: ingest

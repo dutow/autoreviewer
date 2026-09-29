@@ -14,7 +14,7 @@ The topic to review is: `$ARGUMENTS`
 
 ### Step 1: Validate Inputs
 
-1. Verify `<PROJECT>/review/$ARGUMENTS/` exists -- if not, stop with an error telling the user to run `hackorum-patch` first
+1. Verify `<PROJECT>/review/$ARGUMENTS/` exists -- if not, stop with an error telling the user to run the ingestion hook first
 2. Verify `<PROJECT>/review/$ARGUMENTS/metadata.json` exists -- if not, stop with an error telling the user to run the ingestion hook (`<PROJECT>/<INGEST_HOOK> --project <PROJECT>/project.yaml $ARGUMENTS`) first
 3. Read `<PROJECT>/review/$ARGUMENTS/metadata.json` and extract:
    - `version` -> this is the version number (NN)

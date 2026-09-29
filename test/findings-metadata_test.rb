@@ -58,6 +58,18 @@ class FindingsMetadataTest < Minitest::Test
     end
   end
 
+  def test_hackorum_url_from_normalized_metadata
+    with_workspace do |fm, dir|
+      pdir = write_project(dir, 'postgres', "name: postgres\n")
+      write_json(File.join(pdir, 'review', 't5', 'metadata.json'),
+                 'version' => 1, 'hackorum_url' => 'https://hackorum.dev/topics/5')
+      FileUtils.mkdir_p(File.join(pdir, 'findings', 't5', 'v1'))
+
+      data = JSON.parse(File.read(fm.write_topic(File.join(pdir, 'project.yaml'), 't5')))
+      assert_equal 'https://hackorum.dev/topics/5', data['hackorum_url']
+    end
+  end
+
   def test_title_from_discussion_pr_line_beats_generic_overview
     with_workspace do |fm, dir|
       pdir = write_project(dir, 'pg_tde', "name: pg_tde\nsource: percona/pg_tde\n")

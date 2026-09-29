@@ -167,7 +167,7 @@ For each finding:
      Do NOT produce a summary that only covers old messages.
 3. Read build/test status from the build status check
 4. If a previous version directory exists, read its `05-summary.md`
-5. Analyze the diff in the review worktree: run `cd postgres/review/$ARGUMENTS && git log --oneline master..HEAD` and `git diff master...HEAD --stat` to understand the scope
+5. Analyze the diff in the review worktree: run `cd postgres/review/$ARGUMENTS && git log --oneline <base_commit>..HEAD` and `git diff <base_commit>..HEAD --stat` to understand the scope (`base_commit` from `metadata.json`; `master/` may be at a different commit)
 6. Classify the review complexity.
    Criteria (guidance, not a formula): diff size, number of subsystems touched, new abstractions or on-disk/protocol changes, controversy in the discussion.
    Also note whether this is the first reviewed version (no previous `v*` findings directory exists).

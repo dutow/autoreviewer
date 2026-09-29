@@ -2,8 +2,9 @@
 # frozen_string_literal: true
 #
 # postgres ingestion hook.
-# Wraps the EXTERNAL bin/hackorum-patch (never modified) and normalizes its
-# metadata to the project ingestion contract.
+# Checks out the branch hackorum CI already built for the latest patchset
+# (hackorum-dev/postgres t<topic>_<message_number>) and writes metadata per the
+# project ingestion contract. No branch means the patch does not apply.
 #
 # Usage: ingest --project <project.yaml> <topic>
 #   <topic> may be "t139942" or "139942"; the canonical dir name is "t139942".
@@ -12,29 +13,28 @@ require 'yaml'
 require 'json'
 require 'optparse'
 require 'net/http'
-require 'cgi'
+require 'erb'
+require 'fileutils'
+require 'open3'
 
-# thread subject from the topic page; nil on any failure (title is optional)
-def fetch_title(url, limit = 5)
-  return nil if url.nil? || limit.zero?
+HACKORUM = 'https://hackorum.dev'
+BRANCH_REPO = 'https://github.com/hackorum-dev/postgres'
+
+def fetch_json(url, limit = 5)
+  abort "ERROR: too many redirects: #{url}" if limit.zero?
 
   res = Net::HTTP.get_response(URI(url))
   case res
-  when Net::HTTPRedirection then return fetch_title(URI.join(url, res['location']).to_s, limit - 1)
-  when Net::HTTPSuccess then body = res.body
-  else return nil
+  when Net::HTTPRedirection then fetch_json(URI.join(url, res['location']).to_s, limit - 1)
+  when Net::HTTPSuccess then [res.body, JSON.parse(res.body)]
+  else abort "ERROR: #{url}: HTTP #{res.code}"
   end
+end
 
-  m = body.match(%r{<title>(.*?)</title>}m)
-  return nil unless m
-
-  # hackorum double-escapes entities, unescape twice
-  title = CGI.unescapeHTML(CGI.unescapeHTML(m[1])).gsub(/\s+/, ' ').strip
-  title = title.sub(/\APostgreSQL:\s*/, '').sub(/\s*-\s*Hackorum\z/, '')
-  title.empty? ? nil : title
-rescue StandardError => e
-  warn "ingest: title fetch failed #{url}: #{e.message}"
-  nil
+def git(dir, *args)
+  out, status = Open3.capture2('git', '-C', dir, *args)
+  abort "ERROR: git #{args.join(' ')} failed" unless status.success?
+  out.strip
 end
 
 project_yaml = nil
@@ -49,38 +49,69 @@ abort 'ERROR: topic argument is required' unless topic_arg
 project_yaml = File.expand_path(project_yaml)
 config = YAML.safe_load_file(project_yaml)
 project_dir = File.dirname(project_yaml)
-repo_root   = File.expand_path('..', project_dir)   # <name> -> workspace root
 
 numeric   = topic_arg.sub(/\At/, '')
 canonical = "t#{numeric}"
 master    = File.join(project_dir, 'master')
-hackorum  = File.join(repo_root, 'bin', 'hackorum-patch')
-
+abort "ERROR: invalid topic: #{topic_arg}" unless numeric =~ /\A\d+\z/
 abort "ERROR: master checkout not found: #{master}" unless File.directory?(master)
-abort "ERROR: hackorum-patch not found: #{hackorum}" unless File.executable?(hackorum)
+
+summary_raw, summary = fetch_json("#{HACKORUM}/topics/#{numeric}/summary")
+messages_raw, messages = fetch_json("#{HACKORUM}/topics/#{numeric}/messages")
+
+msgnum = (summary['patchsets'] || []).map { |ps| ps['message_number'] }.max
+abort "ERROR: topic #{numeric} has no patchsets" unless msgnum
+
+branch = "#{canonical}_#{msgnum}"
+ref = "refs/hackorum/#{branch}"
+
+# single-ref fetch: the fork has tens of thousands of refs
+puts "ingest: fetching #{BRANCH_REPO} #{branch}"
+unless system('git', '-C', master, 'fetch', '--no-tags', BRANCH_REPO, "+refs/heads/#{branch}:#{ref}")
+  abort "ERROR: no hackorum branch #{branch}: patch does not apply (or hackorum CI has not processed it yet)"
+end
+
+tip_msg = git(master, 'log', '-1', '--format=%B', ref)
+unless tip_msg.lines.first.to_s.strip == "hackorum CI for #{branch}" && tip_msg =~ /^Hackorum-Base:\s*([0-9a-f]{40})\s*$/
+  abort "ERROR: unexpected tip commit on #{branch} (no hackorum CI commit / Hackorum-Base trailer)"
+end
+base = Regexp.last_match(1)
+head = git(master, 'rev-parse', "#{ref}^")
+unless system('git', '-C', master, 'merge-base', '--is-ancestor', base, head)
+  abort "ERROR: Hackorum-Base #{base} is not an ancestor of #{head}"
+end
 
 review_dir = File.join(project_dir, 'review', canonical)
+review_branch = "review/#{canonical}"
+if File.exist?(review_dir)
+  system('git', '-C', master, 'worktree', 'remove', '--force', review_dir, err: File::NULL)
+  FileUtils.rm_rf(review_dir)
+  system('git', '-C', master, 'worktree', 'prune')
+end
+FileUtils.mkdir_p(File.dirname(review_dir))
+git(master, 'worktree', 'add', '-B', review_branch, review_dir, head)
+puts "ingest: worktree #{review_dir} at #{head[0, 12]} (base #{base[0, 12]}, #{git(master, 'rev-list', '--count', "#{base}..#{head}")} commits)"
 
-# Force worktree mode. hackorum's --worktree=auto falls back to branch mode when
-# master/ has no worktrees yet, which checks out the review branch inside master/
-# and dirties the base checkout. Pin the path to where we read results back from.
-puts "ingest: running hackorum-patch --force --worktree=yes #{numeric} (cwd=#{master})"
-ok = system(hackorum, '--force', '--worktree=yes', "--worktree-path=#{review_dir}", numeric, chdir: master)
-abort 'ERROR: hackorum-patch failed' unless ok
+hk_dir = File.join(review_dir, '.hackorum')
+FileUtils.mkdir_p(hk_dir)
+git(review_dir, 'format-patch', '--quiet', '-o', hk_dir, "#{base}..#{head}")
+File.write(File.join(hk_dir, 'summary.json'), summary_raw)
+File.write(File.join(hk_dir, 'messages.json'), messages_raw)
 
-# hackorum >=1.3 writes .hackorum/<topic>.json; older versions wrote metadata.json.
-hk_dir  = File.join(review_dir, '.hackorum')
-hk_path = ["#{numeric}.json", 'metadata.json'].map { |f| File.join(hk_dir, f) }.find { |p| File.exist?(p) }
-abort "ERROR: expected hackorum metadata in #{hk_dir}" unless hk_path
+root_id = (messages['messages'] || []).first&.dig('external_message_id')
+source_url = root_id && "https://www.postgresql.org/message-id/flat/#{ERB::Util.url_encode(root_id)}"
 
-hk = JSON.parse(File.read(hk_path))
 normalized = {
-  'project'     => config['name'],
-  'topic'       => canonical,
-  'version'     => hk['attachment_number'],
-  'title'       => fetch_title(hk['hackorum_url'] || hk['upstream_url']),
-  'source_url'  => hk['upstream_url'],
-  'base_branch' => config['base_branch'],
+  'project'         => config['name'],
+  'topic'           => canonical,
+  'version'         => msgnum,
+  'title'           => summary['title'],
+  'source_url'      => source_url,
+  'hackorum_url'    => "#{HACKORUM}/topics/#{numeric}",
+  'hackorum_branch' => branch,
+  'base_commit'     => base,
+  'head_commit'     => head,
+  'base_branch'     => config['base_branch'],
 }.compact
 
 out = File.join(review_dir, 'metadata.json')
