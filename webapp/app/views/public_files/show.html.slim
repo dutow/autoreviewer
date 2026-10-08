@@ -1,0 +1,34 @@
+.page
+  nav.crumbs
+    = link_to "public", public_dir_path([])
+    - @segs.each_with_index do |seg, i|
+      span.sep /
+      - if i == @segs.size - 1
+        span = seg
+      - else
+        = link_to seg, public_dir_path(@segs[0..i])
+  table.reviews.listing
+    thead
+      tr
+        th Name
+        th Size
+        th Modified
+    tbody
+      - if @segs.any?
+        tr
+          td = link_to "../", public_dir_path(@segs[0...-1])
+          td.num
+          td.date
+      - if @entries.empty?
+        tr
+          td colspan="3"
+            p.empty nothing here
+      - @entries.each do |e|
+        tr
+          td
+            - if e.dir?
+              = link_to "#{e.name}/", public_dir_path(@segs + [e.name])
+            - else
+              = link_to e.name, public_file_path(relpath: (@segs + [e.name]).join("/"))
+          td.num = e.dir? ? "" : number_to_human_size(e.size)
+          td.date = e.mtime.strftime("%Y-%m-%d %H:%M")

@@ -17,6 +17,7 @@ html
   body
     header.topbar
       = link_to "Reviews", root_path, class: "brand"
+      = link_to "Files", public_dir_path([]), class: "nav"
       = form_with url: search_path, method: :get, class: "searchbox" do |f|
         = f.text_field :q, value: params[:q], placeholder: "Search findings…", aria: { label: "Search findings" }
       .right

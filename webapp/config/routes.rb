@@ -9,6 +9,9 @@ Rails.application.routes.draw do
 
   get "search" => "search#index", as: :search
 
+  # glob keeps the real extension (format: false), same as the findings file route
+  get "public(/*relpath)" => "public_files#show", as: :public_file, format: false
+
   # default segment regexp stops at dots; project and topic names may contain them
   constraints project: ReviewsRoot::NAME_SEGMENT, topic: ReviewsRoot::NAME_SEGMENT do
     get "p/:project" => "projects#show", as: :project

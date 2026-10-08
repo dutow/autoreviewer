@@ -49,6 +49,8 @@ h1, h2, h3 { font-family: var(--font-heading); }
           background: var(--topbar-bg); color: var(--topbar-text); }
 .topbar a.brand { font-family: var(--font-heading); font-weight: 700; font-size: 1.05rem;
                   color: var(--topbar-text); }
+.topbar a.nav { color: var(--topbar-text); opacity: .8; font-size: .9rem; }
+.topbar a.nav:hover { opacity: 1; }
 .topbar .right { margin-left: auto; display: flex; gap: .8rem; align-items: center; }
 .topbar .user { color: var(--topbar-text); opacity: .65; font-size: .85rem; }
 .topbar button { background: transparent; color: var(--topbar-text); border: 1px solid var(--border);
@@ -84,6 +86,10 @@ nav.pager a { padding: .25rem .8rem; border-radius: 99px; color: var(--text-dim)
 nav.pager a:hover { background: var(--bg-hover); text-decoration: none; }
 nav.pager a.active { background: var(--active-bg); color: var(--active-text);
                      border-color: var(--accent); font-weight: 600; }
+
+/* ---------- public files ---------- */
+table.listing td.num { color: var(--text-dim); text-align: right; white-space: nowrap; }
+table.listing p.empty { margin: 0; color: var(--text-dim); }
 
 /* ---------- search ---------- */
 ul.results { list-style: none; padding: 0; }
