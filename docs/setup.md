@@ -141,7 +141,7 @@ The proxy then targets `<compose-project>-webapp-1:80`.
 Anything under `workspace/public/` is served at `/public/`, behind the same login as the findings.
 A directory shows a listing, or its `index.html` if it has one (`?list=1` shows the listing anyway).
 Files are sent as-is with the MIME type guessed from the extension, so html/css/js/images render in the browser and everything else downloads.
-Names are limited to `[A-Za-z0-9._-]`, dotfiles are hidden, symlinks must stay inside `public/`.
+Names may use letters, digits, `_`, `-` and `.`, but not start with a dot, so dotfiles are hidden; symlinks must stay inside `public/`.
 
 HTML in there runs on the same origin as the review app, so its scripts can act with your session:
 only put html there that you wrote or read.

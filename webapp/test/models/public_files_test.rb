@@ -7,6 +7,7 @@ class PublicFilesTest < ActiveSupport::TestCase
     write("readme.txt", "hi")
     write("site/index.html", "<p>x</p>")
     write("site/.hidden", "h")
+    write("_next/chunk.js", "x")
     FileUtils.mkdir_p(File.join(@pub, "empty"))
     File.symlink("/etc", File.join(@pub, "escape"))
     File.symlink("/nonexistent", File.join(@pub, "dangling"))
@@ -35,6 +36,7 @@ class PublicFilesTest < ActiveSupport::TestCase
     assert @files.exist?
     assert_equal File.realpath(@pub), @files.resolve("")
     assert_equal File.realpath(File.join(@pub, "site/index.html")), @files.resolve("site/index.html")
+    assert_equal File.realpath(File.join(@pub, "_next/chunk.js")), @files.resolve("_next/chunk.js")
     assert_equal File.realpath(File.join(@pub, "readme.txt")), @files.resolve("alias.txt"),
                  "symlink inside the root is fine"
   end
@@ -52,7 +54,7 @@ class PublicFilesTest < ActiveSupport::TestCase
 
   test "entries dirs first, hidden and escaping skipped" do
     names = @files.entries(@files.resolve("")).map { |e| [e.name, e.dir?] }
-    assert_equal [["empty", true], ["site", true], ["alias.txt", false], ["readme.txt", false]], names
+    assert_equal [["_next", true], ["empty", true], ["site", true], ["alias.txt", false], ["readme.txt", false]], names
     site = @files.entries(@files.resolve("site"))
     assert_equal ["index.html"], site.map(&:name)
     assert_equal 8, site.first.size

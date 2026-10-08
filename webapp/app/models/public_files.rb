@@ -1,6 +1,6 @@
 class PublicFiles
   DIR = "public"
-  SEGMENT_RE = /\A#{ReviewsRoot::NAME_SEGMENT}\z/
+  SEGMENT_RE = /\A[A-Za-z0-9_-][A-Za-z0-9._-]*\z/
   FS_ERRORS = [Errno::ENOENT, Errno::ENOTDIR, Errno::EACCES, Errno::ELOOP, Errno::ENAMETOOLONG].freeze
 
   Entry = Struct.new(:name, :dir, :size, :mtime, keyword_init: true) do

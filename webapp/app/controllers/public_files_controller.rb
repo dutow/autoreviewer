@@ -1,5 +1,7 @@
 class PublicFilesController < ApplicationController
   before_action { request.format = :html }
+  # csrf layer 422s any non-xhr GET that answers with javascript; these are static files
+  skip_after_action :verify_same_origin_request
 
   def show
     files = PublicFiles.new
@@ -13,7 +15,7 @@ class PublicFilesController < ApplicationController
 
     unless trailing_slash?
       query = request.query_string.present? ? "?#{request.query_string}" : ""
-      return redirect_to "#{request.path}/#{query}"
+      return redirect_to "#{helpers.public_dir_path(@segs)}#{query}"
     end
 
     index = files.resolve((@segs + ["index.html"]).join("/"))

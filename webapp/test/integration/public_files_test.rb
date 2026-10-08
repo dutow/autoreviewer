@@ -13,6 +13,7 @@ class PublicFilesBrowseTest < ActionDispatch::IntegrationTest
     write("site/app.js", "1;")
     write("dl/blob.qqq", "\x00\x01\xffbin".b)
     write("dl/.hidden", "x")
+    write("_next/chunk.js", "1;")
     FileUtils.mkdir_p(File.join(@pub, "empty"))
     File.symlink("site", File.join(@pub, "alias"))
     File.write(File.join(@reviews_dir, "secret.html"), "<p>SECRET</p>")
@@ -48,7 +49,7 @@ class PublicFilesBrowseTest < ActionDispatch::IntegrationTest
   test "root listing: dirs first, hidden and escaping skipped" do
     get "/public/"
     assert_response :success
-    assert_equal ["alias/", "dl/", "empty/", "site/", "readme.txt"], listed_names
+    assert_equal ["_next/", "alias/", "dl/", "empty/", "site/", "readme.txt"], listed_names
     assert_select "table.listing td.num", text: "5 Bytes"
     assert_select "table.listing td.date", minimum: 1
     assert_select "nav.crumbs a[href=?]", "/public/"
@@ -90,6 +91,11 @@ class PublicFilesBrowseTest < ActionDispatch::IntegrationTest
     assert_response :success
     assert_equal "application/octet-stream", response.content_type
     assert_equal "\x00\x01\xffbin".b, response.body.b
+
+    get "/public/_next/chunk.js"
+    assert_response :success
+    assert_match %r{\Atext/javascript}, response.content_type
+    assert_equal "1;", response.body
   end
 
   test "conditional get" do
