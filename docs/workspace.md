@@ -27,6 +27,8 @@ At the workspace root:
 - `CLAUDE.md` - identity and layout notes for claude sessions run in this workspace (see below).
 - `Dockerfile` - optional, adds project build deps to the queue image (see below).
 - `bin/` - workspace-shared hooks and vendored tools.
+- `public/` - optional, static files the webapp serves as-is at `/public/` (see [setup.md](setup.md#static-files)).
+  Commit the contents or gitignore the big downloads, your call.
 
 ## Gitignored
 
