@@ -30,7 +30,7 @@ tasks:
     deps: [setup]
     cmds:
       - '{{.DOCKER}} build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t autoreviewer-base:local .'
-      - 'UID=$(id -u) GID=$(id -g) {{.COMPOSE}} {{.PROFILES}} build'
+      - 'env UID=$(id -u) GID=$(id -g) {{.COMPOSE}} {{.PROFILES}} build'
 
   up:
     desc: Start review queue + webapp
