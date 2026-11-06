@@ -170,6 +170,28 @@ class ReviewPollRunOnceTest < Minitest::Test
     end
   end
 
+  def test_only_reviewed_enqueues_changed_prs_with_findings_only
+    with_poller do |poller|
+      dir = poller.base_dir
+      FileUtils.mkdir_p(File.join(dir, 'psp', 'findings', 'pr2'))
+      proj = [PROJ.first.merge(findings_dir: File.join(dir, 'psp', 'findings'), only_reviewed: true)]
+      poller.state['psp'] = { 'pr1' => 'aaa', 'pr2' => 'bbb' }
+      calls = []
+      poller.run_once(
+        projects: proj,
+        fetch: fetch_returning([
+          { number: 1, head: 'AAA' },   # changed, never reviewed
+          { number: 2, head: 'BBB' },   # changed, reviewed
+          { number: 3, head: 'ccc' },   # new
+        ]),
+        enqueue: recording_enqueue(calls),
+        refresh: recording_refresh([])
+      )
+      assert_equal [['psp', 'pr2']], calls
+      assert_equal({ 'pr1' => 'AAA', 'pr2' => 'BBB', 'pr3' => 'ccc' }, poller.state['psp'])
+    end
+  end
+
   def test_closed_pr_drops_from_state
     with_poller do |poller|
       poller.state['psp'] = { 'pr1' => 'aaa', 'pr2' => 'bbb' }

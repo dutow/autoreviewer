@@ -62,6 +62,8 @@ class ReviewPoll
         prefix:      cfg['topic_prefix'] || 'pr',
         base_branch: cfg['base_branch'],
         master_dir:  File.join(@projects_dir, dir_name, 'master'),
+        findings_dir: File.join(@projects_dir, dir_name, 'findings'),
+        only_reviewed: cfg.dig('poll', 'only_reviewed') == true,
         commit_review: cfg['commit_review'],
       }
     rescue StandardError => e
@@ -273,7 +275,12 @@ class ReviewPoll
             new_state[d[:topic]] = d[:head]
           when :changed
             kind = prev.key?(d[:topic]) ? 'new commits' : 'new PR'
-            if enqueue.call(proj[:name], d[:topic])
+            if proj[:only_reviewed] && !Dir.exist?(File.join(proj[:findings_dir].to_s, d[:topic]))
+              # Track the head without reviewing: once the PR is reviewed by
+              # hand, its later pushes are polled like any other.
+              new_state[d[:topic]] = d[:head]
+              log "#{proj[:name]}: #{d[:topic]} #{kind} #{d[:head][0, 7]}, not reviewed yet, skipped (only_reviewed)"
+            elsif enqueue.call(proj[:name], d[:topic])
               new_state[d[:topic]] = d[:head]
               log "#{proj[:name]}: #{d[:topic]} #{kind} #{d[:head][0, 7]}, enqueued"
             else

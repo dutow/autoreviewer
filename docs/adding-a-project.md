@@ -149,6 +149,10 @@ The poller wakes every `REVIEW_POLL_INTERVAL` seconds (default: 180) and, for ea
 If a PR's `head_sha` changed since it was last enqueued, the PR is re-enqueued.
 Only new commits trigger a re-review - comments and review threads are ignored.
 
+To re-review only PRs you have already reviewed, add `only_reviewed: true` to the `poll` block.
+A changed or new PR is then enqueued only if `<name>/findings/<topic>/` exists; otherwise its head is recorded and skipped.
+Once you review such a PR by hand (`task enqueue`), its later pushes are polled like any other.
+
 On first run the poller silently baselines: it records the current head shas for all open PRs and enqueues nothing.
 Only subsequent new commits or brand-new PRs are picked up from that point on.
 
