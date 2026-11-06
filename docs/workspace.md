@@ -45,6 +45,7 @@ Per the example `.gitignore` (`examples/workspace/.gitignore`):
 ```
 
 These are either derived (checkouts, build output) or local run state (worktrees, the current-review symlink, the commit-review ledger) - none of it is meant to travel with the repo.
+`*/builds/<topic>` and `*/review/<topic>` are also pruned automatically once a topic goes untouched for a week (see [setup.md](setup.md#pruning-old-builds-and-worktrees)); nothing you want to keep belongs there.
 
 The workspace-root `current-reviews/` is a directory of per-project symlinks into each project's own `current-reviews/`.
 It's rebuilt by the infra script `bin/refresh-current-reviews` - run it by hand if the tree gets out of sync (e.g. after adding a project or pruning findings).

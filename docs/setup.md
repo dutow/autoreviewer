@@ -146,6 +146,24 @@ Names may use letters, digits, `_`, `-` and `.`, but not start with a dot, so do
 HTML in there runs on the same origin as the review app, so its scripts can act with your session:
 only put html there that you wrote or read.
 
+## Pruning old builds and worktrees
+
+Builds and review worktrees pile up: a postgres topic is a few GB, so a few months of reviews fill a disk.
+`bin/review-prune` removes `<name>/builds/<topic>/` and `<name>/review/<topic>/` for every topic untouched for `REVIEW_PRUNE_DAYS` days (default 7, `0` disables).
+A topic's age is the newest mtime across its build dir, its `status.yaml` files and its review worktree, so a re-review restarts the clock.
+It never touches `builds/master`, builds named after a `branches/` checkout (the stable-branch installs other projects build against), or a topic whose review tmux window is still open.
+Findings are untouched: they live in `findings/` and are committed.
+
+The queue runs it at startup and before each build, so the space is freed before the next build needs it.
+Run it by hand, or preview what would go:
+
+```
+task prune -- --dry-run
+task prune -- --days 30
+```
+
+A pruned topic can always be reviewed again: `task enqueue` re-ingests and rebuilds it from scratch, and the findings version keeps counting up from the committed `findings/<topic>/v*` dirs.
+
 ## Stopping and lifecycle
 
 `task down` is **not graceful** to in-flight reviews: it kills the tmux server, which kills any running claude session mid-review.

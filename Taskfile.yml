@@ -122,9 +122,14 @@ tasks:
       - 'test -d workspace || { echo "FAIL workspace/ missing - task init-workspace or clone your repo"; exit 1; }'
       - '{{.COMPOSE}} run --rm --no-deps review-queue bin/review-queue --check'
 
+  prune:
+    desc: 'Remove builds and review worktrees older than REVIEW_PRUNE_DAYS: task prune -- [--dry-run] [--days N]'
+    cmds: ['{{.COMPOSE}} run --rm --no-deps review-queue bin/review-prune {{.CLI_ARGS}}']
+
   test:
     desc: Run the script test suites in the container
     cmds:
       - '{{.COMPOSE}} run --rm --no-deps review-queue ruby test/findings-metadata_test.rb'
       - '{{.COMPOSE}} run --rm --no-deps review-queue ruby test/review-poll_test.rb'
+      - '{{.COMPOSE}} run --rm --no-deps review-queue ruby test/review-prune_test.rb'
 

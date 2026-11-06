@@ -1,0 +1,111 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# Removes per-topic build output (<name>/builds/<topic>) and review worktrees
+# (<name>/review/<topic>) older than REVIEW_PRUNE_DAYS (default 7, 0 disables).
+# A topic's age is the newest mtime across its builds dir, status.yaml files and
+# review dir, so a re-reviewed topic starts over. Keeps builds/master, builds
+# named after a branches/ checkout, and topics whose review tmux window is open.
+#
+# Usage: review-prune [--dry-run] [--days N]
+
+require 'fileutils'
+require 'shellwords'
+
+class ReviewPrune
+  DAY = 86_400
+
+  def initialize(workspace_dir:, days:, active_windows: nil)
+    @workspace_dir = workspace_dir
+    @days = days.to_i
+    @active_windows = active_windows
+  end
+
+  def candidates
+    return [] if @days <= 0
+    cutoff = Time.now - @days * DAY
+    active = active_windows
+    Dir.glob(File.join(@workspace_dir, '*', 'project.yaml')).sort.flat_map do |yaml|
+      project_dir = File.dirname(yaml)
+      project = File.basename(project_dir)
+      keep = %w[master] + children(File.join(project_dir, 'branches'))
+      names = %w[builds review].flat_map { |d| children(File.join(project_dir, d)) }
+      names.uniq.sort.filter_map do |topic|
+        next if keep.include?(topic) || active.include?("#{project}-#{topic}")
+        dirs = [File.join(project_dir, 'builds', topic), File.join(project_dir, 'review', topic)].select { |d| File.directory?(d) }
+        newest = dirs.flat_map { |d| [d] + Dir.glob(File.join(d, '*', 'status.yaml')) + [File.join(d, 'metadata.json')] }
+                     .select { |p| File.exist?(p) }.map { |p| File.mtime(p) }.max
+        next unless newest && newest < cutoff
+        { project: project, topic: topic, dirs: dirs, age_days: ((Time.now - newest) / DAY).floor,
+          master: File.join(project_dir, 'master') }
+      end
+    end
+  end
+
+  def run(dry_run: false, out: $stdout)
+    list = candidates
+    if list.empty?
+      out.puts "review-prune: nothing older than #{@days} days"
+      return 0
+    end
+    freed = 0
+    list.each do |c|
+      kb = c[:dirs].sum { |d| size_kb(d) }
+      freed += kb
+      out.puts "review-prune: #{dry_run ? 'would remove' : 'removing'} #{c[:project]}/#{c[:topic]} (#{c[:age_days]}d, #{human(kb)})"
+      remove(c) unless dry_run
+    end
+    out.puts "review-prune: #{dry_run ? 'would free' : 'freed'} #{human(freed)} from #{list.size} topic(s)"
+    list.size
+  end
+
+  private
+
+  def remove(c)
+    master = c[:master]
+    if File.exist?(File.join(master, '.git'))
+      review = File.join(File.dirname(master), 'review', c[:topic])
+      git(master, 'worktree', 'remove', '--force', review) if c[:dirs].include?(review)
+      git(master, 'worktree', 'prune')
+      branch = "review/#{c[:topic]}"
+      git(master, 'branch', '-D', branch) if git(master, 'rev-parse', '-q', '--verify', "refs/heads/#{branch}")
+    end
+    c[:dirs].each { |d| FileUtils.rm_rf(d) }
+  end
+
+  def children(dir)
+    File.directory?(dir) ? Dir.children(dir) : []
+  end
+
+  def git(dir, *args)
+    system('git', '-C', dir, *args, out: File::NULL, err: File::NULL)
+  end
+
+  def active_windows
+    return @active_windows if @active_windows
+    `tmux list-windows -t reviews -F '#W' 2>/dev/null`.split("\n")
+  end
+
+  def size_kb(dir)
+    `du -sk #{Shellwords.escape(dir)} 2>/dev/null`.split.first.to_i
+  end
+
+  def human(kb)
+    return "#{kb}K" if kb < 1024
+    mb = kb / 1024.0
+    return format('%.1fM', mb) if mb < 1024
+    format('%.1fG', mb / 1024)
+  end
+end
+
+if __FILE__ == $0
+  dry_run = ARGV.delete('--dry-run')
+  days = ENV['REVIEW_PRUNE_DAYS'].to_s.empty? ? 7 : ENV['REVIEW_PRUNE_DAYS']
+  if (i = ARGV.index('--days'))
+    days = ARGV[i + 1]
+    ARGV.slice!(i, 2)
+  end
+  base_dir = File.expand_path('..', __dir__)
+  ws = ENV['WORKSPACE_DIR'].to_s.empty? ? File.join(base_dir, 'workspace') : File.expand_path(ENV['WORKSPACE_DIR'])
+  ReviewPrune.new(workspace_dir: ws, days: days).run(dry_run: !dry_run.nil?)
+end

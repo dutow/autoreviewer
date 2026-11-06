@@ -36,6 +36,7 @@ class ReviewQueue
     puts ""
 
     check_command_drift
+    prune_old
 
     while @running
       topic_id = next_topic
@@ -166,6 +167,17 @@ class ReviewQueue
     puts "[#{timestamp}] WARNING: could not run drift check: #{e.message}"
   end
 
+  def prune_old
+    script = File.join(@base_dir, 'bin', 'review-prune')
+    return unless File.executable?(script)
+
+    out, status = Open3.capture2e(script)
+    out.each_line { |l| puts "[#{timestamp}] #{l}" unless l.include?('nothing older') }
+    puts "[#{timestamp}] WARNING: review-prune failed" unless status.success?
+  rescue => e
+    puts "[#{timestamp}] WARNING: could not run review-prune: #{e.message}"
+  end
+
   def next_topic
     return nil unless File.exist?(@queue_file)
 
@@ -222,6 +234,7 @@ class ReviewQueue
       return
     end
 
+    prune_old
     configs.each do |cfg|
       puts "[#{timestamp}] Building #{topic} with #{cfg}..."
       ok = run_hook([build_hook, '--project', yaml, topic, cfg], cwd: @base_dir)
