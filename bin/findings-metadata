@@ -9,6 +9,7 @@
 #   findings-metadata --project <project.yaml> <topic>   # current version of one topic
 #   findings-metadata --backfill                         # fill all missing, all projects
 #   findings-metadata --backfill-titles                  # fetch missing titles into existing files
+#   findings-metadata --backfill-counts                  # findings.json from 03-review-validated.md
 
 require 'json'
 require 'yaml'
@@ -82,6 +83,44 @@ class FindingsMetadata
     end
     puts "backfill-titles: wrote #{count} metadata files"
     count
+  end
+
+  # findings.json for old reviews, parsed from the validated findings markdown
+  def backfill_counts
+    count = 0
+    Dir.glob(File.join(@base_dir, '*', 'findings', '*', 'v*', '03-review-validated.md')).sort.each do |md|
+      out = File.join(File.dirname(md), 'findings.json')
+      next if File.exist?(out)
+
+      File.write(out, JSON.pretty_generate(counts_from_validated(File.read(md))) + "\n")
+      count += 1
+    end
+    puts "backfill-counts: wrote #{count} findings files"
+    count
+  end
+
+  SEVERITIES = %w[BUG LIKELY_BUG SUSPICIOUS RISKY NITPICK TYPO].freeze
+
+  def counts_from_validated(text)
+    severity = SEVERITIES.to_h { |s| [s, 0] }
+    post = fyi = 0
+    withdrawn = nil
+    skip = false
+    text.each_line do |line|
+      if line =~ /\A## (.*)/
+        skip = Regexp.last_match(1) =~ /withdrawn|resolved|fixed/i
+      elsif line =~ /\A- Withdrawn:\s*(\d+)/
+        withdrawn ||= Regexp.last_match(1).to_i
+      elsif skip
+        next
+      elsif line =~ /\A\*\*(?:Validated )?Severity:\*\*\s*([A-Z_]+)\b/
+        sev = Regexp.last_match(1)
+        severity[sev] += 1 if severity.key?(sev)
+      elsif line =~ /\A\*\*Post-worthiness:\*\*\s*(POST|FYI)\b/
+        Regexp.last_match(1) == 'POST' ? post += 1 : fyi += 1
+      end
+    end
+    { 'severity' => severity, 'post' => post, 'fyi' => fyi, 'withdrawn' => withdrawn || 0 }
   end
 
   private
@@ -204,10 +243,12 @@ if __FILE__ == $0
     FindingsMetadata.new(base_dir: base_dir).backfill
   elsif ARGV.include?('--backfill-titles')
     FindingsMetadata.new(base_dir: base_dir).backfill_titles
+  elsif ARGV.include?('--backfill-counts')
+    FindingsMetadata.new(base_dir: base_dir).backfill_counts
   else
     idx = ARGV.index('--project')
     unless idx && ARGV[idx + 1] && ARGV[idx + 2]
-      abort 'usage: findings-metadata --project <project.yaml> <topic> | --backfill | --backfill-titles'
+      abort 'usage: findings-metadata --project <project.yaml> <topic> | --backfill | --backfill-titles | --backfill-counts'
     end
     exit 1 unless FindingsMetadata.new(base_dir: base_dir).write_topic(ARGV[idx + 1], ARGV[idx + 2])
   end

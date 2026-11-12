@@ -15,6 +15,27 @@ class IndexerTest < ActiveSupport::TestCase
     end
   end
 
+  test "finding counts from findings json" do
+    with_reviews_root do |root, dir|
+      Indexer.new(root: root).run
+      v2 = ReviewVersion.find_by!(project: "alpha", topic: "t1", version: 2)
+      assert_equal [1, 0, 2, 0, 3, 0, 2, 4, 1],
+                   v2.values_at(:bug_count, :likely_bug_count, :suspicious_count, :risky_count,
+                                :nitpick_count, :typo_count, :post_count, :fyi_count, :withdrawn_count)
+      assert_equal "bug", v2.worst_severity
+      v1 = ReviewVersion.find_by!(project: "alpha", topic: "t1", version: 1)
+      refute v1.counts?
+      assert_nil v1.worst_severity
+      refute Document.exists?(relpath: "findings.json")
+
+      ReviewsFixture.commit_change(dir, "alpha/findings/t1/v2/findings.json",
+                                   '{"severity": {"BUG": 0, "LIKELY_BUG": "x"}}')
+      Indexer.new(root: root).run
+      v2.reload
+      assert_equal [0, 0, 0], v2.values_at(:bug_count, :likely_bug_count, :post_count)
+    end
+  end
+
   test "fallbacks for version without metadata" do
     with_reviews_root do |root, _|
       Indexer.new(root: root).run

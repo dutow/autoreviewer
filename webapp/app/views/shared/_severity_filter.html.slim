@@ -1,0 +1,3 @@
+nav.filters.severity
+  - [["any findings", nil], ["likely bug+", "likely_bug"], ["bug", "bug"]].each do |label, min|
+    = link_to label, list_url("min" => min), class: params[:min].presence == min ? "active" : nil

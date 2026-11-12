@@ -1,7 +1,6 @@
 .page
   h1 = @project.name
-  = render "shared/version_toggle",
-      latest_url: project_path(@project.name),
-      all_url: project_path(@project.name, versions: "all")
+  = render "shared/version_toggle"
+  = render "shared/severity_filter"
   = render "shared/review_table", reviews: @reviews
   = render "shared/pager"

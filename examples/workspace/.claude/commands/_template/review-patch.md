@@ -673,6 +673,20 @@ Include ONLY findings classified POST. FYI findings must not appear here.]
 - FYI: N
 ```
 
+Write `<PROJECT>/findings/$ARGUMENTS/v{version}/findings.json` with counts of the surviving findings in `03-review-validated.md` (Confirmed, Downgraded and Trivial; Withdrawn findings only go to `withdrawn`), by validated severity, and by post-worthiness:
+
+```json
+{
+  "severity": {"BUG": 0, "LIKELY_BUG": 0, "SUSPICIOUS": 0, "RISKY": 0, "NITPICK": 0, "TYPO": 0},
+  "post": 0,
+  "fyi": 0,
+  "withdrawn": 0
+}
+```
+
+Every key must be present with an integer value, 0 when there is nothing to count.
+The counts must match the Statistics section above.
+
 Refresh the committed metadata so the title reflects the overview:
 `../bin/findings-metadata --project <PROJECT>/project.yaml $ARGUMENTS`
 

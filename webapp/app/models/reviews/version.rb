@@ -20,6 +20,14 @@ module Reviews
       end
     end
 
+    def finding_counts
+      @finding_counts ||= begin
+        JSON.parse(File.read(File.join(dir, "findings.json")))
+      rescue Errno::ENOENT, Errno::ENOTDIR, JSON::ParserError
+        {}
+      end
+    end
+
     def files
       Dir.glob(File.join(dir, "**", "*"))
          .select { |p| File.file?(p) && !File.symlink?(p) }
@@ -28,7 +36,7 @@ module Reviews
     end
 
     def display_files
-      files.reject { |f| f.relpath == "metadata.json" }
+      files.reject(&:internal?)
     end
 
     def default_file

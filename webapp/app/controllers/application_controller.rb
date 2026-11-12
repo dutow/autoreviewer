@@ -32,6 +32,7 @@ class ApplicationController < ActionController::Base
 
   def filtered_reviews(scope)
     scope = scope.latest_per_topic unless params[:versions] == "all"
+    scope = scope.min_severity(params[:min])
     @total_count = scope.count
     @page_count = [(@total_count + PER_PAGE - 1) / PER_PAGE, 1].max
     @page = params[:page].to_s.to_i.clamp(1, @page_count)

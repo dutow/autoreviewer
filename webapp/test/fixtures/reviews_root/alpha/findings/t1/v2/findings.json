@@ -1,0 +1,6 @@
+{
+  "severity": {"BUG": 1, "LIKELY_BUG": 0, "SUSPICIOUS": 2, "RISKY": 0, "NITPICK": 3, "TYPO": 0},
+  "post": 2,
+  "fyi": 4,
+  "withdrawn": 1
+}

@@ -57,6 +57,9 @@ Each version directory is immutable once written: previous versions are never ed
 
 - `metadata.json` - a committed copy of the topic metadata (title, source_url, reviewed_at, etc.) for the web frontend.
   Written by `bin/findings-metadata` (called by the queue and by review commands), or `bin/findings-metadata --backfill` for existing history.
+- `findings.json` - finding counts by severity (`severity.BUG`, `severity.LIKELY_BUG`, ...), plus `post`, `fyi`, `withdrawn`.
+  Written by the review command; the web frontend shows and filters on it.
+  `bin/findings-metadata --backfill-counts` fills missing ones by parsing `03-review-validated.md`.
 - The review command's phase output files (overview, design review, code review, validated findings, PR discussion cross-reference, summary, `patches/`, `tests/`, `discussion.txt`).
 
 The agent commits review progress after completing each phase - so a review's history is visible in the workspace's git log, not just its final state.

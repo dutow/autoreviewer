@@ -211,4 +211,62 @@ class FindingsMetadataTest < Minitest::Test
       assert_equal 'KEEP', JSON.parse(File.read(File.join(done, 'metadata.json')))['reviewed_at']
     end
   end
+
+  VALIDATED_MD = <<~MD
+    # Validated Findings: t1 v2
+
+    ## Validation Summary
+    - Confirmed: 2
+    - Withdrawn: 3
+
+    ## Confirmed Findings
+
+    ### Finding: a
+    **Severity:** BUG
+    **Post-worthiness:** POST -- yes
+
+    ### Finding: b
+    **Severity:** RISKY.
+    **Post-worthiness:** FYI -- meh
+
+    ## Withdrawn Findings
+
+    **Severity:** BUG
+
+    ## Trivial Findings (validation skipped)
+
+    ### Finding: c
+    **Severity:** NITPICK
+    **Post-worthiness:** FYI -- style
+
+    ### Finding: d
+    **Severity:** MINOR
+  MD
+
+  def test_counts_from_validated
+    with_workspace do |fm, _|
+      c = fm.counts_from_validated(VALIDATED_MD)
+      assert_equal({ 'BUG' => 1, 'LIKELY_BUG' => 0, 'SUSPICIOUS' => 0, 'RISKY' => 1,
+                     'NITPICK' => 1, 'TYPO' => 0 }, c['severity'])
+      assert_equal 1, c['post']
+      assert_equal 2, c['fyi']
+      assert_equal 3, c['withdrawn']
+    end
+  end
+
+  def test_backfill_counts_skips_existing
+    with_workspace do |fm, dir|
+      v1 = File.join(dir, 'postgres', 'findings', 't1', 'v1')
+      v2 = File.join(dir, 'postgres', 'findings', 't1', 'v2')
+      [v1, v2].each do |v|
+        FileUtils.mkdir_p(v)
+        File.write(File.join(v, '03-review-validated.md'), VALIDATED_MD)
+      end
+      File.write(File.join(v1, 'findings.json'), '{"keep":1}')
+
+      assert_equal 1, fm.backfill_counts
+      assert_equal({ 'keep' => 1 }, JSON.parse(File.read(File.join(v1, 'findings.json'))))
+      assert_equal 1, JSON.parse(File.read(File.join(v2, 'findings.json')))['severity']['BUG']
+    end
+  end
 end

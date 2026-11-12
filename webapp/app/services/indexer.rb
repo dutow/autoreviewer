@@ -81,7 +81,8 @@ class Indexer
         source_url: meta["source_url"],
         hackorum_url: meta["hackorum_url"],
         reviewed_at: parse_time(meta["reviewed_at"]) || git_time(v.relpath),
-        path: v.relpath
+        path: v.relpath,
+        **counts_attributes(v.finding_counts)
       )
       rv.save! if rv.changed?
 
@@ -110,6 +111,15 @@ class Indexer
       rv.destroy!
     end
   end
+
+  def counts_attributes(c)
+    sev = c["severity"].is_a?(Hash) ? c["severity"] : nil
+    attrs = ReviewVersion::SEVERITIES.to_h { |s| [:"#{s}_count", sev && count(sev[s.upcase])] }
+    attrs.merge(post_count: sev && count(c["post"]), fyi_count: sev && count(c["fyi"]),
+                withdrawn_count: sev && count(c["withdrawn"]))
+  end
+
+  def count(v) = v.is_a?(Integer) ? v : 0
 
   def fallback_title(v)
     overview = File.join(v.dir, "00-overview.md")

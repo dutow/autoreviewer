@@ -27,8 +27,12 @@ module Reviews
 
     def language = LANGUAGES[File.extname(abspath).downcase]
 
+    INTERNAL = %w[metadata.json findings.json].freeze
+
+    def internal? = INTERNAL.include?(relpath)
+
     def indexable?
-      kind != "binary" && relpath != "metadata.json" && size <= MAX_TEXT_BYTES
+      kind != "binary" && !internal? && size <= MAX_TEXT_BYTES
     end
 
     def read_text

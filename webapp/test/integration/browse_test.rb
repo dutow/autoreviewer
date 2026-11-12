@@ -196,6 +196,36 @@ class BrowseTest < ActionDispatch::IntegrationTest
     assert_select "nav.pager a[href*='versions=all']"
   end
 
+  test "findings column badges row highlight and severity filter" do
+    get "/"
+    t1 = css_select("table.reviews tbody tr").find { |tr| tr.text.include?("t1") }
+    assert_includes t1["class"], "row-bug"
+    assert_includes t1.text, "1 BUG"
+    assert_includes t1.text, "2 SUSP"
+    assert_includes t1.text, "2 to post"
+    refute_includes t1.text, "LIKELY"
+    pr5 = css_select("table.reviews tbody tr").find { |tr| tr.text.include?("pr5") }
+    assert_nil pr5["class"]
+
+    get "/?min=bug"
+    topics = css_select("table.reviews tbody tr td:nth-child(2) a").map(&:text)
+    assert_equal %w[t1], topics
+    assert_select "nav.filters.severity a.active", text: "bug"
+    assert_select "nav.filters a[href*='min=bug']", text: "alpha"
+    assert_select "nav.filters.versions a[href*='min=bug']", text: "all versions"
+
+    get "/?min=likely_bug&versions=all"
+    topics = css_select("table.reviews tbody tr td:nth-child(2) a").map(&:text)
+    assert_equal %w[t1], topics, "t1 v1 has no counts"
+    get "/?min=bogus"
+    assert_select "table.reviews tbody tr", count: 2
+  end
+
+  test "findings json hidden from files" do
+    get "/p/alpha/t/t1/v/2/f/00-overview.md"
+    assert_select ".side details.files a", { text: /findings\.json/, count: 0 }
+  end
+
 test "dotted project and topic names route" do
   ReviewsFixture.commit_change(@reviews_dir, "beta/findings/release-2.4.0/v1/00-summary.md", "# Release 2.4.0\n")
   ReviewsFixture.commit_change(@reviews_dir, "gamma.next/project.yaml", "name: gamma.next\n")
