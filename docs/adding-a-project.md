@@ -174,13 +174,41 @@ This is deliberately a one-shot command rather than a `project.yaml` flag: a dec
 State is tracked in `state/poll.state` at the infra repo root (override with `REVIEW_POLL_STATE`).
 This file is gitignored (it lives under `state/`, not in the workspace).
 
+### Hackorum polling (postgres)
+
+Mailing-list projects can be fed from the [hackorum](https://hackorum.dev/help/api) event feed instead of manual `task enqueue`:
+
+```yaml
+poll:
+  enabled: true
+  hackorum: true
+  only_reviewed: false   # optional
+```
+
+Each poll cycle reads `branch.created` events from `https://hackorum.dev/api/v1/events` (`HACKORUM_API` overrides the API base URL, default `https://hackorum.dev/api/v1`).
+Hackorum emits one per patchset version on its first apply attempt; rebases are not re-reported, so they never trigger a review.
+A branch `t<id>_<N>` that applied and was pushed to GitHub enqueues topic `t<id>` (version `N`).
+Branches that failed to apply are skipped.
+Applied but not yet pushed branches are kept pending and rechecked each cycle for up to 24h.
+
+A version is skipped when `findings/t<id>/v<N>` already exists or a version `>= N` was already enqueued by the poller.
+A topic that is already waiting in the queue (a line after the one currently being processed) is not enqueued again, and neither is one enqueued earlier in the same cycle: ingest always takes the latest patchset, so one queued review covers every version that arrived meanwhile.
+With `only_reviewed: true`, only topics that already have `findings/t<id>/` are enqueued.
+
+On first run the poller baselines at the current time and enqueues nothing: the backlog is never processed.
+If the stored cursor is older than hackorum's 90-day retention (`cursor_expired`), it re-baselines the same way.
+API errors skip the hackorum step for that cycle; the cursor only advances after a page is fully processed.
+
+State lives in `state/poll.state` under `<project>.hackorum` (`cursor`, `pending`, `enqueued`).
+
 ### Base-branch refresh
 
 Each poll cycle, before checking PRs, `review-poll` refreshes every poll-enabled project's base branch(es): `git fetch origin <base>` then force the local ref to `origin/<base>` - `reset --hard` when that branch is checked out (e.g. postgres `master/`), `branch -f` when the checkout is detached (e.g. the GitHub-PR host).
 The base is treated as a canonical upstream mirror; local edits on it are discarded.
 
 - GitHub-PR projects refresh the distinct set of open-PR base branches (from `baseRefName`) unioned with `base_branch`.
-- A project with `poll.enabled: true` and **no** `source` (e.g. postgres) is *refresh-only*: its base is refreshed every cycle, but no PRs are polled and it never touches `state/poll.state`.
+- A project with `poll.enabled: true` and **no** `source` (e.g. postgres) is *refresh-only*: its base is refreshed every cycle, but it polls no PRs and stores no PR state.
+  `state/poll.state` still holds its commit-review and hackorum state when those are enabled.
 
 Because of this, `poll.enabled` only requires a `base_branch`; `source` is optional.
 

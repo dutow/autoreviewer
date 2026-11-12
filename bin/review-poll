@@ -9,14 +9,28 @@
 # Env:   REVIEW_POLL_INTERVAL (seconds, default 180)
 #        REVIEW_POLL_STATE    (state file, default <repo>/state/poll.state)
 #        REVIEW_POLL_COMMITS_NOW (bypass commit-review window+throttle once; don't export permanently)
+#        HACKORUM_API         (default https://hackorum.dev/api/v1)
 
 require 'json'
 require 'time'
 require 'yaml'
 require 'fileutils'
 require 'shellwords'
+require 'net/http'
+require 'uri'
+require 'set'
 
 $stdout.sync = true
+
+class HackorumError < StandardError
+  attr_reader :status, :code
+
+  def initialize(status, code, message = nil)
+    @status = status
+    @code = code
+    super(message || "hackorum HTTP #{status}#{code ? " #{code}" : ''}")
+  end
+end
 
 class ReviewPoll
   attr_reader :state, :base_dir
@@ -28,6 +42,8 @@ class ReviewPoll
     state_dir = File.expand_path(env_or('STATE_DIR', File.join(@base_dir, 'state')))
     @state_file = env_or('REVIEW_POLL_STATE', File.join(state_dir, 'poll.state'))
     FileUtils.mkdir_p(File.dirname(@state_file))
+    @queue_file = env_or('REVIEW_QUEUE_FILE', File.join(state_dir, 'queue'))
+    @queue_processed_file = env_or('REVIEW_QUEUE_PROCESSED', File.join(state_dir, 'queue.processed'))
     @interval = (ENV['REVIEW_POLL_INTERVAL'] || 180).to_i
     @once = once
     @state = load_state
@@ -64,6 +80,7 @@ class ReviewPoll
         master_dir:  File.join(@projects_dir, dir_name, 'master'),
         findings_dir: File.join(@projects_dir, dir_name, 'findings'),
         only_reviewed: cfg.dig('poll', 'only_reviewed') == true,
+        hackorum:    cfg.dig('poll', 'hackorum') == true,
         commit_review: cfg['commit_review'],
       }
     rescue StandardError => e
@@ -187,6 +204,202 @@ class ReviewPoll
     end
   end
 
+  HACKORUM_API = 'https://hackorum.dev/api/v1'
+
+  def hackorum_parse(status, body)
+    parsed = begin
+      JSON.parse(body.to_s)
+    rescue JSON::ParserError
+      nil
+    end
+    return parsed if status.between?(200, 299) && parsed.is_a?(Hash)
+
+    code = parsed.is_a?(Hash) ? parsed.dig('error', 'code') : nil
+    raise HackorumError.new(status, code)
+  end
+
+  def hackorum_get(path, params = {})
+    uri = URI("#{env_or('HACKORUM_API', HACKORUM_API)}#{path}")
+    uri.query = URI.encode_www_form(params) unless params.empty?
+    res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https',
+                          open_timeout: 15, read_timeout: 60) do |http|
+      http.get(uri.request_uri, 'Accept' => 'application/json')
+    end
+    hackorum_parse(res.code.to_i, res.body)
+  rescue HackorumError
+    raise
+  rescue StandardError => e
+    raise HackorumError.new(0, nil, "hackorum request failed: #{e.message}")
+  end
+
+  HACKORUM_PENDING_TTL = 24 * 3600
+
+  def hackorum_state(name)
+    st = @state[name]
+    hk = st.is_a?(Hash) ? st['hackorum'] : nil
+    hk.is_a?(Hash) ? hk : {}
+  end
+
+  def store_hackorum_state(name, hk)
+    st = @state[name]
+    st = {} unless st.is_a?(Hash)
+    st['hackorum'] = hk
+    @state[name] = st
+    save_state
+  end
+
+  def hackorum_baseline(proj, hk, fetch, now)
+    page = fetch.call('/events', types: 'branch.created', since: now.getutc.iso8601)
+    unless page.is_a?(Hash) && page['next_cursor']
+      log "WARNING: #{proj[:name]}: hackorum baseline returned no cursor, will retry"
+      return
+    end
+    hk['cursor'] = page['next_cursor']
+    hk['pending'] ||= {}
+    hk['enqueued'] ||= {}
+    store_hackorum_state(proj[:name], hk)
+    log "#{proj[:name]}: hackorum baseline recorded"
+  end
+
+  def queued_topics(project)
+    return Set.new unless File.exist?(@queue_file)
+    offset = File.exist?(@queue_processed_file) ? File.read(@queue_processed_file).strip.to_i : 0
+    lines = File.readlines(@queue_file, chomp: true).reject(&:empty?)
+    lines.drop(offset + 1).filter_map do |l|
+      w = l.split
+      w[1] if w[0] == project
+    end.to_set
+  end
+
+  # true unless the enqueue itself failed
+  def hackorum_candidate(proj, hk, topic, n, enqueue)
+    if hk['enqueued'][topic].to_i >= n
+      return true
+    end
+    if Dir.exist?(File.join(proj[:findings_dir].to_s, topic, "v#{n}"))
+      log "#{proj[:name]}: #{topic} v#{n} already reviewed, skipped"
+      return true
+    end
+    if proj[:only_reviewed] && !Dir.exist?(File.join(proj[:findings_dir].to_s, topic))
+      log "#{proj[:name]}: #{topic} v#{n} not reviewed yet, skipped (only_reviewed)"
+      return true
+    end
+    if @hackorum_fresh.include?(topic) || queued_topics(proj[:name]).include?(topic)
+      hk['enqueued'][topic] = n
+      log "#{proj[:name]}: #{topic} v#{n} already queued, skipped"
+      return true
+    end
+    unless enqueue.call(proj[:name], topic)
+      log "#{proj[:name]}: #{topic} v#{n} enqueue failed, will retry next cycle"
+      return false
+    end
+    hk['enqueued'][topic] = n
+    @hackorum_fresh << topic
+    log "#{proj[:name]}: #{topic} v#{n} enqueued"
+    true
+  end
+
+  def hackorum_branch(proj, hk, br, enqueue, now)
+    unless br.is_a?(Hash)
+      log "#{proj[:name]}: hackorum event without branch, skipped"
+      return true
+    end
+    m = br['branch_name'].to_s.match(/\At(\d+)_(\d+)\z/)
+    unless m
+      log "#{proj[:name]}: hackorum branch #{br['branch_name'].inspect} unparsable, skipped"
+      return true
+    end
+    topic = "t#{m[1]}"
+    n = m[2].to_i
+    if br['status'] != 'applied'
+      log "#{proj[:name]}: #{topic} v#{n} did not apply, skipped"
+      return true
+    end
+    if br['pushed_at'].nil?
+      return true if hk['enqueued'][topic].to_i >= n
+      if br['id'].nil?
+        log "#{proj[:name]}: hackorum branch without id, skipped"
+        return true
+      end
+      hk['pending'][br['id'].to_s] ||= { 'topic' => topic, 'number' => n, 'seen_at' => now.getutc.iso8601 }
+      return true
+    end
+    hackorum_candidate(proj, hk, topic, n, enqueue)
+  end
+
+  def hackorum_recheck_pending(proj, hk, fetch, enqueue, now)
+    hk['pending'].keys.each do |id|
+      entry = hk['pending'][id]
+      unless entry.is_a?(Hash)
+        hk['pending'].delete(id)
+        log "#{proj[:name]}: hackorum pending entry #{id} malformed, dropped"
+        next
+      end
+      seen = (Time.parse(entry['seen_at']) rescue nil)
+      if seen.nil? || now - seen > HACKORUM_PENDING_TTL
+        hk['pending'].delete(id)
+        log "#{proj[:name]}: #{entry['topic']} v#{entry['number']} never pushed, dropped"
+        next
+      end
+      br = begin
+        fetch.call("/branches/#{id}")
+      rescue HackorumError => e
+        log "WARNING: #{proj[:name]}: hackorum branch #{id} recheck failed: #{e.message}"
+        break
+      end
+      unless br.is_a?(Hash)
+        hk['pending'].delete(id)
+        log "#{proj[:name]}: hackorum branch #{id} malformed, dropped"
+        next
+      end
+      if br['status'] != 'applied'
+        hk['pending'].delete(id)
+        log "#{proj[:name]}: #{entry['topic']} v#{entry['number']} did not apply, dropped"
+      elsif br['pushed_at'] && hackorum_candidate(proj, hk, entry['topic'], entry['number'].to_i, enqueue)
+        hk['pending'].delete(id)
+      end
+    end
+  end
+
+  def process_hackorum(proj, fetch: method(:hackorum_get), enqueue: method(:enqueue_topic), now: Time.now)
+    hk = hackorum_state(proj[:name])
+    @hackorum_fresh = Set.new
+    return hackorum_baseline(proj, hk, fetch, now) unless hk['cursor']
+
+    hk['pending'] ||= {}
+    hk['enqueued'] ||= {}
+    hackorum_recheck_pending(proj, hk, fetch, enqueue, now)
+    store_hackorum_state(proj[:name], hk)
+    loop do
+      page = fetch.call('/events', types: 'branch.created', limit: 200, since: hk['cursor'])
+      raise HackorumError.new(0, nil, 'malformed events page') unless page.is_a?(Hash) && page['data'].is_a?(Array)
+      ok = page['data'].all? do |ev|
+        !ev.is_a?(Hash) ? hackorum_branch(proj, hk, nil, enqueue, now) :
+          ev['type'] != 'branch.created' || hackorum_branch(proj, hk, ev['branch'], enqueue, now)
+      end
+      unless ok
+        store_hackorum_state(proj[:name], hk)
+        return
+      end
+      hk['cursor'] = page['next_cursor'] || hk['cursor']
+      store_hackorum_state(proj[:name], hk)
+      break unless page['has_more'] && page['next_cursor']
+    end
+  rescue HackorumError => e
+    if e.code == 'cursor_expired'
+      log "WARNING: #{proj[:name]}: hackorum cursor expired, re-baselining (missed events are not reviewed)"
+      hk.delete('cursor')
+      begin
+        hackorum_baseline(proj, hk, fetch, now)
+      rescue HackorumError => e2
+        log "WARNING: #{proj[:name]}: hackorum re-baseline failed: #{e2.message}"
+      end
+    else
+      store_hackorum_state(proj[:name], hk) if hk['cursor']
+      log "WARNING: #{proj[:name]}: hackorum poll failed, skipping this cycle: #{e.message}"
+    end
+  end
+
   def open_prs(source)
     raw = nil
     IO.popen(['gh', '-R', source, 'pr', 'list', '--state', 'open',
@@ -241,7 +454,8 @@ class ReviewPoll
 
   def run_once(projects: enabled_projects, fetch: method(:open_prs),
                enqueue: method(:enqueue_topic), refresh: method(:refresh_bases),
-               enqueue_commits: method(:enqueue_commit_batch), now: Time.now)
+               enqueue_commits: method(:enqueue_commit_batch),
+               hackorum_fetch: method(:hackorum_get), now: Time.now)
     return if projects.empty?
     log "poll cycle: #{projects.map { |p| p[:name] }.join(', ')}"
     projects.each do |proj|
@@ -258,13 +472,23 @@ class ReviewPoll
       refresh.call(proj, bases)
       prev = @state[proj[:name]] # read before commit reviews touch state
       process_commit_reviews(proj, enqueue_commits: enqueue_commits, now: now) if proj[:commit_review]
+      if proj[:hackorum]
+        begin
+          process_hackorum(proj, fetch: hackorum_fetch, enqueue: enqueue, now: now)
+        rescue StandardError => e
+          log "WARNING: #{proj[:name]}: hackorum step crashed: #{e.class}: #{e.message}"
+        end
+      end
       next unless proj[:source]
 
       result = plan(prev, prs)
       cr = commit_review_state(proj[:name])
+      cur = @state[proj[:name]]
+      hk_keep = cur.is_a?(Hash) ? cur['hackorum'] : nil
       if result[:baseline]
         new_map = prs.to_h { |pr| [pr[:topic], pr[:head]] }
         new_map['commit_review'] = cr if cr
+        new_map['hackorum'] = hk_keep if hk_keep
         @state[proj[:name]] = new_map
         log "#{proj[:name]}: baseline recorded (#{prs.size} open PRs)"
       else
@@ -289,6 +513,7 @@ class ReviewPoll
           end
         end
         new_state['commit_review'] = cr if cr
+        new_state['hackorum'] = hk_keep if hk_keep
         @state[proj[:name]] = new_state
       end
       save_state

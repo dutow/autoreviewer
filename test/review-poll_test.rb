@@ -615,3 +615,482 @@ class ReviewPollCommitReviewTest < Minitest::Test
     end
   end
 end
+
+class ReviewPollHackorumClientTest < Minitest::Test
+  def with_poller
+    Dir.mktmpdir do |dir|
+      ENV['REVIEW_POLL_STATE'] = File.join(dir, '.review-poll.state')
+      ENV['WORKSPACE_DIR'] = dir
+      yield ReviewPoll.new(base_dir: dir), dir
+    ensure
+      ENV.delete('REVIEW_POLL_STATE')
+      ENV.delete('WORKSPACE_DIR')
+    end
+  end
+
+  def write_project(dir, name, contents)
+    FileUtils.mkdir_p(File.join(dir, name))
+    File.write(File.join(dir, name, 'project.yaml'), contents)
+  end
+
+  def test_enabled_projects_hackorum_flag
+    with_poller do |poller, dir|
+      write_project(dir, 'pg', "name: pg\nbase_branch: master\npoll:\n  enabled: true\n  hackorum: true\n")
+      write_project(dir, 'gh', "name: gh\nsource: o/gh\nbase_branch: main\npoll:\n  enabled: true\n")
+      by_name = poller.enabled_projects.to_h { |p| [p[:name], p] }
+      assert_equal true, by_name['pg'][:hackorum]
+      assert_equal false, by_name['gh'][:hackorum]
+    end
+  end
+
+  def test_parse_success
+    with_poller do |poller, _|
+      assert_equal({ 'data' => [] }, poller.hackorum_parse(200, '{"data":[]}'))
+    end
+  end
+
+  def test_parse_api_error_code
+    with_poller do |poller, _|
+      e = assert_raises(HackorumError) do
+        poller.hackorum_parse(410, '{"error":{"code":"cursor_expired","message":"x"}}')
+      end
+      assert_equal 410, e.status
+      assert_equal 'cursor_expired', e.code
+    end
+  end
+
+  def test_parse_non_json_error
+    with_poller do |poller, _|
+      e = assert_raises(HackorumError) { poller.hackorum_parse(502, 'not json') }
+      assert_equal 502, e.status
+      assert_nil e.code
+    end
+  end
+
+  def test_parse_non_json_success_raises
+    with_poller do |poller, _|
+      assert_raises(HackorumError) { poller.hackorum_parse(200, 'not json') }
+    end
+  end
+
+  def test_get_network_error_is_hackorum_error
+    with_poller do |poller, _|
+      ENV['HACKORUM_API'] = 'http://127.0.0.1:1/api/v1'
+      e = assert_raises(HackorumError) { poller.hackorum_get('/events', since: 'x') }
+      assert_equal 0, e.status
+    ensure
+      ENV.delete('HACKORUM_API')
+    end
+  end
+end
+
+class ReviewPollHackorumTest < Minitest::Test
+  NOW = Time.utc(2026, 11, 12, 10, 0, 0).freeze
+
+  def with_poller
+    Dir.mktmpdir do |dir|
+      ENV['REVIEW_POLL_STATE'] = File.join(dir, '.review-poll.state')
+      ENV['WORKSPACE_DIR'] = dir
+      ENV['REVIEW_QUEUE_FILE'] = File.join(dir, 'queue')
+      ENV['REVIEW_QUEUE_PROCESSED'] = File.join(dir, 'queue.processed')
+      proj = { name: 'pg', source: nil, prefix: 't', base_branch: 'master',
+               master_dir: File.join(dir, 'pg', 'master'),
+               findings_dir: File.join(dir, 'pg', 'findings'),
+               only_reviewed: false, hackorum: true }
+      yield ReviewPoll.new(base_dir: dir), proj
+    ensure
+      ENV.delete('REVIEW_POLL_STATE')
+      ENV.delete('WORKSPACE_DIR')
+      ENV.delete('REVIEW_QUEUE_FILE')
+      ENV.delete('REVIEW_QUEUE_PROCESSED')
+    end
+  end
+
+  def write_queue(lines, offset)
+    File.write(ENV['REVIEW_QUEUE_FILE'], lines.map { |l| "#{l}\n" }.join)
+    File.write(ENV['REVIEW_QUEUE_PROCESSED'], offset.to_s)
+  end
+
+  def branch(id, topic, n, status: 'applied', pushed: true)
+    { 'id' => id, 'branch_name' => "t#{topic}_#{n}", 'topic' => { 'id' => topic },
+      'status' => status, 'pushed_at' => pushed ? '2026-11-12T09:59:00Z' : nil }
+  end
+
+  def ev(br)
+    { 'type' => 'branch.created', 'branch' => br }
+  end
+
+  # routes: { "/events?since=c1" => page | HackorumError, "/branches/5" => branch | HackorumError }
+  def fake_fetch(routes, calls)
+    lambda do |path, params = {}|
+      key = path == '/events' ? "/events?since=#{params[:since]}" : path
+      calls << [path, params]
+      r = routes.fetch(key) { raise HackorumError.new(404, 'not_found') }
+      raise r if r.is_a?(Exception)
+      r
+    end
+  end
+
+  def page(events, cursor, more: false)
+    { 'data' => events, 'next_cursor' => cursor, 'has_more' => more }
+  end
+
+  def enq(log, fail: [])
+    ->(p, t) { log << [p, t]; !fail.include?(t) }
+  end
+
+  def hk(poller)
+    poller.state.dig('pg', 'hackorum')
+  end
+
+  def test_baseline_stores_cursor_without_enqueue
+    with_poller do |poller, proj|
+      calls = []
+      log = []
+      fetch = fake_fetch({ "/events?since=#{NOW.iso8601}" => page([ev(branch(1, 10, 1))], 'c1') }, calls)
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq(log), now: NOW)
+      assert_empty log
+      assert_equal 'c1', hk(poller)['cursor']
+      assert_equal 'branch.created', calls.first[1][:types]
+    end
+  end
+
+  def test_pushed_enqueued_failed_skipped_unpushed_pending
+    with_poller do |poller, proj|
+      poller.state['pg'] = { 'hackorum' => { 'cursor' => 'c1', 'pending' => {}, 'enqueued' => {} } }
+      log = []
+      fetch = fake_fetch({ '/events?since=c1' => page([
+        ev(branch(1, 10, 3)),
+        ev(branch(2, 11, 1, status: 'failed', pushed: false)),
+        ev(branch(3, 12, 2, pushed: false)),
+      ], 'c2') }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq(log), now: NOW)
+      assert_equal [['pg', 't10']], log
+      assert_equal 'c2', hk(poller)['cursor']
+      assert_equal({ 't10' => 3 }, hk(poller)['enqueued'])
+      assert_equal ['3'], hk(poller)['pending'].keys
+      assert_equal({ 'topic' => 't12', 'number' => 2, 'seen_at' => NOW.iso8601 }, hk(poller)['pending']['3'])
+    end
+  end
+
+  def test_pending_recheck_outcomes
+    with_poller do |poller, proj|
+      old = (NOW - 25 * 3600).iso8601
+      poller.state['pg'] = { 'hackorum' => { 'cursor' => 'c1', 'enqueued' => {}, 'pending' => {
+        '3' => { 'topic' => 't12', 'number' => 2, 'seen_at' => NOW.iso8601 },
+        '4' => { 'topic' => 't13', 'number' => 1, 'seen_at' => NOW.iso8601 },
+        '5' => { 'topic' => 't14', 'number' => 1, 'seen_at' => NOW.iso8601 },
+        '6' => { 'topic' => 't15', 'number' => 1, 'seen_at' => old },
+        '7' => { 'topic' => 't16', 'number' => 1, 'seen_at' => NOW.iso8601 },
+      } } }
+      calls = []
+      log = []
+      fetch = fake_fetch({
+        '/branches/3' => branch(3, 12, 2),
+        '/branches/4' => branch(4, 13, 1, status: 'failed', pushed: false),
+        '/branches/5' => HackorumError.new(502, nil),
+        '/branches/7' => branch(7, 16, 1, pushed: false),
+        '/events?since=c1' => page([], 'c1'),
+      }, calls)
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq(log), now: NOW)
+      assert_equal [['pg', 't12']], log
+      assert_equal %w[5 6 7], hk(poller)['pending'].keys.sort
+      assert_equal 2, hk(poller)['enqueued']['t12']
+      refute_includes calls.map(&:first), '/branches/6'
+    end
+  end
+
+  def test_dedup_by_enqueued_and_findings
+    with_poller do |poller, proj|
+      FileUtils.mkdir_p(File.join(proj[:findings_dir], 't11', 'v4'))
+      poller.state['pg'] = { 'hackorum' => { 'cursor' => 'c1', 'pending' => {}, 'enqueued' => { 't10' => 5 } } }
+      log = []
+      fetch = fake_fetch({ '/events?since=c1' => page([
+        ev(branch(1, 10, 5)), ev(branch(2, 11, 4)), ev(branch(3, 10, 6)),
+      ], 'c2') }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq(log), now: NOW)
+      assert_equal [['pg', 't10']], log
+      assert_equal 6, hk(poller)['enqueued']['t10']
+    end
+  end
+
+  def test_only_reviewed
+    with_poller do |poller, proj|
+      proj = proj.merge(only_reviewed: true)
+      FileUtils.mkdir_p(File.join(proj[:findings_dir], 't20', 'v1'))
+      poller.state['pg'] = { 'hackorum' => { 'cursor' => 'c1', 'pending' => {}, 'enqueued' => {} } }
+      log = []
+      fetch = fake_fetch({ '/events?since=c1' => page([ev(branch(1, 20, 2)), ev(branch(2, 21, 1))], 'c2') }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq(log), now: NOW)
+      assert_equal [['pg', 't20']], log
+      assert_equal 'c2', hk(poller)['cursor']
+    end
+  end
+
+  def test_pagination_follows_has_more
+    with_poller do |poller, proj|
+      poller.state['pg'] = { 'hackorum' => { 'cursor' => 'c1', 'pending' => {}, 'enqueued' => {} } }
+      log = []
+      fetch = fake_fetch({
+        '/events?since=c1' => page([ev(branch(1, 10, 1))], 'c2', more: true),
+        '/events?since=c2' => page([ev(branch(2, 11, 1))], 'c3'),
+      }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq(log), now: NOW)
+      assert_equal [['pg', 't10'], ['pg', 't11']], log
+      assert_equal 'c3', hk(poller)['cursor']
+    end
+  end
+
+  def test_cursor_expired_rebaselines
+    with_poller do |poller, proj|
+      poller.state['pg'] = { 'hackorum' => { 'cursor' => 'old', 'pending' => {}, 'enqueued' => { 't10' => 2 } } }
+      log = []
+      fetch = fake_fetch({
+        '/events?since=old' => HackorumError.new(410, 'cursor_expired'),
+        "/events?since=#{NOW.iso8601}" => page([ev(branch(1, 11, 1))], 'fresh'),
+      }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq(log), now: NOW)
+      assert_empty log
+      assert_equal 'fresh', hk(poller)['cursor']
+      assert_equal({ 't10' => 2 }, hk(poller)['enqueued'])
+    end
+  end
+
+  def test_other_error_keeps_cursor
+    with_poller do |poller, proj|
+      poller.state['pg'] = { 'hackorum' => { 'cursor' => 'c1', 'pending' => {}, 'enqueued' => {} } }
+      fetch = fake_fetch({ '/events?since=c1' => HackorumError.new(429, 'rate_limited') }, [])
+      log = []
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq(log), now: NOW)
+      assert_equal 'c1', hk(poller)['cursor']
+      assert_empty log
+    end
+  end
+
+  def test_enqueue_failure_stops_page_and_replay_is_safe
+    with_poller do |poller, proj|
+      poller.state['pg'] = { 'hackorum' => { 'cursor' => 'c1', 'pending' => {}, 'enqueued' => {} } }
+      routes = { '/events?since=c1' => page([ev(branch(1, 10, 1)), ev(branch(2, 11, 1)), ev(branch(3, 12, 1))], 'c2') }
+      log = []
+      poller.process_hackorum(proj, fetch: fake_fetch(routes, []), enqueue: enq(log, fail: ['t11']), now: NOW)
+      assert_equal [['pg', 't10'], ['pg', 't11']], log
+      assert_equal 'c1', hk(poller)['cursor']
+      assert_equal({ 't10' => 1 }, hk(poller)['enqueued'])
+
+      reloaded = ReviewPoll.new(base_dir: poller.base_dir)
+      log2 = []
+      reloaded.process_hackorum(proj, fetch: fake_fetch(routes, []), enqueue: enq(log2), now: NOW)
+      assert_equal [['pg', 't11'], ['pg', 't12']], log2
+      assert_equal 'c2', reloaded.state.dig('pg', 'hackorum', 'cursor')
+    end
+  end
+
+  def test_run_once_calls_hackorum_and_keeps_commit_review
+    with_poller do |poller, proj|
+      poller.state['pg'] = { 'commit_review' => { 'last_sha' => 'abc' },
+                             'hackorum' => { 'cursor' => 'c1', 'pending' => {}, 'enqueued' => {} } }
+      log = []
+      poller.run_once(projects: [proj],
+                      refresh: ->(_p, _b) {},
+                      enqueue: enq(log),
+                      hackorum_fetch: fake_fetch({ '/events?since=c1' => page([ev(branch(1, 10, 1))], 'c2') }, []),
+                      now: NOW)
+      assert_equal [['pg', 't10']], log
+      assert_equal({ 'last_sha' => 'abc' }, poller.state['pg']['commit_review'])
+      assert_equal 'c2', hk(poller)['cursor']
+    end
+  end
+
+  def test_pr_path_preserves_hackorum_state
+    with_poller do |poller, _|
+      poller.state['psp'] = { 'pr1' => 'aaa', 'hackorum' => { 'cursor' => 'c9' } }
+      projects = [{ name: 'psp', source: 'o/psp', prefix: 'pr', base_branch: 'main', master_dir: '/tmp/nope' }]
+      poller.run_once(projects: projects,
+                      fetch: ->(_s) { [{ number: 1, head: 'bbb' }] },
+                      enqueue: ->(_p, _t) { true },
+                      refresh: ->(_p, _b) {})
+      assert_equal 'bbb', poller.state['psp']['pr1']
+      assert_equal({ 'cursor' => 'c9' }, poller.state['psp']['hackorum'])
+    end
+  end
+
+  def seeded(poller, enqueued: {})
+    poller.state['pg'] = { 'hackorum' => { 'cursor' => 'c1', 'pending' => {}, 'enqueued' => enqueued } }
+  end
+
+  def test_nil_data_page_skips_cycle
+    with_poller do |poller, proj|
+      seeded(poller)
+      fetch = fake_fetch({ '/events?since=c1' => { 'data' => nil, 'next_cursor' => 'c2', 'has_more' => false } }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq([]), now: NOW)
+      assert_equal 'c1', hk(poller)['cursor']
+    end
+  end
+
+  def test_event_without_branch_is_skipped
+    with_poller do |poller, proj|
+      seeded(poller)
+      log = []
+      fetch = fake_fetch({ '/events?since=c1' => page([
+        { 'type' => 'branch.created', 'branch' => nil }, 'junk', ev(branch(1, 10, 1)),
+      ], 'c2') }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq(log), now: NOW)
+      assert_equal [['pg', 't10']], log
+      assert_equal 'c2', hk(poller)['cursor']
+    end
+  end
+
+  def test_run_once_survives_hackorum_crash
+    with_poller do |poller, proj|
+      seeded(poller)
+      poller.run_once(projects: [proj], refresh: ->(_p, _b) {}, enqueue: enq([]),
+                      hackorum_fetch: ->(_p, _q = {}) { raise 'boom' }, now: NOW)
+      assert_equal 'c1', hk(poller)['cursor']
+    end
+  end
+
+  def test_pending_recheck_drops_malformed
+    with_poller do |poller, proj|
+      poller.state['pg'] = { 'hackorum' => { 'cursor' => 'c1', 'enqueued' => {}, 'pending' => {
+        '3' => { 'topic' => 't12', 'number' => 2, 'seen_at' => NOW.iso8601 },
+        '4' => 'garbage',
+      } } }
+      fetch = fake_fetch({ '/branches/3' => nil, '/events?since=c1' => page([], 'c1') }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq([]), now: NOW)
+      assert_empty hk(poller)['pending']
+    end
+  end
+
+  def test_nil_next_cursor_keeps_cursor
+    with_poller do |poller, proj|
+      seeded(poller)
+      fetch = fake_fetch({ '/events?since=c1' => page([ev(branch(1, 10, 1))], nil) }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq([]), now: NOW)
+      assert_equal 'c1', hk(poller)['cursor']
+    end
+  end
+
+  def test_baseline_nil_cursor_stores_nothing
+    with_poller do |poller, proj|
+      log = []
+      fetch = fake_fetch({ "/events?since=#{NOW.iso8601}" => page([], nil) }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq(log), now: NOW)
+      assert_nil poller.state.dig('pg', 'hackorum', 'cursor')
+      assert_empty log
+    end
+  end
+
+  def test_replayed_unpushed_branch_not_pending_when_enqueued
+    with_poller do |poller, proj|
+      seeded(poller, enqueued: { 't12' => 2 })
+      fetch = fake_fetch({ '/events?since=c1' => page([ev(branch(3, 12, 2, pushed: false))], 'c2') }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq([]), now: NOW)
+      assert_empty hk(poller)['pending']
+    end
+  end
+
+  def test_second_page_enqueue_failure_keeps_first_page_cursor
+    with_poller do |poller, proj|
+      seeded(poller)
+      log = []
+      fetch = fake_fetch({
+        '/events?since=c1' => page([ev(branch(1, 10, 1))], 'c2', more: true),
+        '/events?since=c2' => page([ev(branch(2, 11, 1))], 'c3'),
+      }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq(log, fail: ['t11']), now: NOW)
+      assert_equal 'c2', hk(poller)['cursor']
+      assert_equal({ 't10' => 1 }, hk(poller)['enqueued'])
+    end
+  end
+
+  def run_queue_case(lines, offset, events)
+    with_poller do |poller, proj|
+      seeded(poller)
+      write_queue(lines, offset)
+      log = []
+      enqueue = lambda do |p, t|
+        log << [p, t]
+        File.open(ENV['REVIEW_QUEUE_FILE'], 'a') { |f| f.puts "#{p} #{t}" }
+        true
+      end
+      fetch = fake_fetch({ '/events?since=c1' => page(events, 'c2') }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enqueue, now: NOW)
+      yield poller, log
+    end
+  end
+
+  def test_skips_topic_waiting_in_queue
+    run_queue_case(['pg t1', 'pg t10'], 0, [ev(branch(1, 10, 2))]) do |poller, log|
+      assert_empty log
+      assert_equal 2, hk(poller)['enqueued']['t10']
+      assert_equal 'c2', hk(poller)['cursor']
+    end
+  end
+
+  def test_topic_at_offset_is_not_waiting
+    run_queue_case(['pg t10'], 0, [ev(branch(1, 10, 2))]) do |_poller, log|
+      assert_equal [['pg', 't10']], log
+    end
+  end
+
+  def test_same_run_versions_enqueue_once
+    run_queue_case([], 0, [ev(branch(1, 10, 1)), ev(branch(2, 10, 2))]) do |poller, log|
+      assert_equal [['pg', 't10']], log
+      assert_equal 2, hk(poller)['enqueued']['t10']
+    end
+  end
+
+  def test_other_project_queue_line_ignored
+    run_queue_case(['x', 'gh t10'], 0, [ev(branch(1, 10, 2))]) do |_poller, log|
+      assert_equal [['pg', 't10']], log
+    end
+  end
+
+  def test_queue_without_processed_file_treats_line_zero_as_in_flight
+    with_poller do |poller, proj|
+      seeded(poller)
+      File.write(ENV['REVIEW_QUEUE_FILE'], "pg t1\npg t10\n")
+      log = []
+      fetch = fake_fetch({ '/events?since=c1' => page([ev(branch(1, 10, 2))], 'c2') }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq(log), now: NOW)
+      assert_empty log
+    end
+  end
+
+  def test_has_more_without_next_cursor_does_not_loop
+    with_poller do |poller, proj|
+      seeded(poller)
+      log = []
+      calls = []
+      fetch = fake_fetch({ '/events?since=c1' => { 'data' => [ev(branch(1, 10, 1))], 'next_cursor' => nil, 'has_more' => true } }, calls)
+      Timeout.timeout(5) { poller.process_hackorum(proj, fetch: fetch, enqueue: enq(log), now: NOW) }
+      assert_equal [['pg', 't10']], log
+      assert_equal 'c1', hk(poller)['cursor']
+    end
+  end
+
+  def test_recheck_stops_after_first_fetch_error
+    with_poller do |poller, proj|
+      poller.state['pg'] = { 'hackorum' => { 'cursor' => 'c1', 'enqueued' => {}, 'pending' => {
+        '3' => { 'topic' => 't12', 'number' => 2, 'seen_at' => NOW.iso8601 },
+        '4' => { 'topic' => 't13', 'number' => 1, 'seen_at' => NOW.iso8601 },
+        '5' => { 'topic' => 't14', 'number' => 1, 'seen_at' => NOW.iso8601 },
+      } } }
+      calls = []
+      fetch = fake_fetch({ '/branches/3' => HackorumError.new(502, nil), '/events?since=c1' => page([], 'c1') }, calls)
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq([]), now: NOW)
+      assert_equal 1, calls.count { |c| c[0].start_with?('/branches/') }
+      assert_equal %w[3 4 5], hk(poller)['pending'].keys.sort
+    end
+  end
+
+  def test_unpushed_branch_without_id_not_pending
+    with_poller do |poller, proj|
+      seeded(poller)
+      fetch = fake_fetch({ '/events?since=c1' => page([ev(branch(nil, 10, 1, pushed: false))], 'c2') }, [])
+      poller.process_hackorum(proj, fetch: fetch, enqueue: enq([]), now: NOW)
+      assert_empty hk(poller)['pending']
+      assert_equal 'c2', hk(poller)['cursor']
+    end
+  end
+end
