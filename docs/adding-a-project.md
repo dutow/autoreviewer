@@ -227,6 +227,7 @@ Once you review such a PR by hand (`task enqueue`), its later pushes are polled 
 
 A changed or new PR is not enqueued right away: the poller waits until its head has stayed the same for `debounce_minutes` (default 120), so a burst of pushes gets one review of the last one.
 A newer push restarts the wait.
+When the wait ends, a PR already in the queue (e.g. enqueued by hand meanwhile) or whose review worktree is already at that head is recorded and not enqueued again.
 Set `debounce_minutes: 0` in the `poll` block to enqueue on the first cycle that sees the change.
 The wait applies to GitHub-PR projects only; hackorum topics are enqueued as before.
 While waiting, the poller logs `<name>: <topic> new commits <sha>, waiting for quiet (<n> min)` and keeps the pending head in `state/poll.state`.

@@ -98,10 +98,21 @@ class ReviewPoll
     return [true, rest] if minutes <= 0
 
     entry = pending[topic]
-    return [false, rest.merge(topic => { 'head' => head, 'seen_at' => now.getutc.iso8601 })] unless entry && entry['head'] == head
+    seen = entry.is_a?(Hash) && entry['head'] == head ? (Time.iso8601(entry['seen_at'].to_s) rescue nil) : nil
+    return [false, rest.merge(topic => { 'head' => head, 'seen_at' => now.getutc.iso8601 })] unless seen
 
-    quiet = now - Time.iso8601(entry['seen_at']) >= minutes * 60
-    quiet ? [true, rest] : [false, pending]
+    now - seen >= minutes * 60 ? [true, rest] : [false, pending]
+  end
+
+  # A manual enqueue or an earlier review may already cover this head.
+  def already_handled?(proj, topic, head)
+    return true if queued_topics(proj[:name]).include?(topic)
+    return false unless proj[:findings_dir]
+
+    meta = File.join(File.dirname(proj[:findings_dir]), 'review', topic, 'metadata.json')
+    File.exist?(meta) && JSON.parse(File.read(meta))['head_sha'] == head
+  rescue JSON::ParserError, SystemCallError
+    false
   end
 
   # Pure classifier. prev: nil (project not yet baselined) or Hash{topic => sha}.
@@ -528,6 +539,9 @@ class ReviewPoll
             if !ready
               new_state[d[:topic]] = prev[d[:topic]] if prev.key?(d[:topic])
               log "#{proj[:name]}: #{d[:topic]} #{kind} #{d[:head][0, 7]}, waiting for quiet (#{minutes} min)"
+            elsif minutes.positive? && already_handled?(proj, d[:topic], d[:head])
+              new_state[d[:topic]] = d[:head]
+              log "#{proj[:name]}: #{d[:topic]} #{kind} #{d[:head][0, 7]}, already queued or reviewed, skipped"
             elsif enqueue.call(proj[:name], d[:topic])
               new_state[d[:topic]] = d[:head]
               log "#{proj[:name]}: #{d[:topic]} #{kind} #{d[:head][0, 7]}, enqueued"

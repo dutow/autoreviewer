@@ -443,6 +443,49 @@ class ReviewPollDebounceTest < Minitest::Test
     end
   end
 
+  def test_debounce_ready_malformed_entry_restarts_wait
+    with_poller do |p|
+      [5, ['x'], { 'head' => 'a' }, { 'head' => 'a', 'seen_at' => 'garbage' }].each do |bad|
+        ready, pending = p.debounce_ready?({ 'pr1' => bad }, 'pr1', 'a', T0, 120)
+        refute ready
+        assert_equal({ 'pr1' => { 'head' => 'a', 'seen_at' => T0.iso8601 } }, pending)
+      end
+    end
+  end
+
+  def test_debounce_manual_enqueue_during_wait_not_duplicated
+    with_poller do |poller|
+      dir = poller.base_dir
+      FileUtils.mkdir_p(File.join(dir, 'state'))
+      File.write(File.join(dir, 'state', 'queue'), "psp pr9\npsp pr1\n")
+      File.write(File.join(dir, 'state', 'queue.processed'), "0\n")
+      poller.state['psp'] = { 'pr1' => 'aaa' }
+      calls = []
+      prs = [{ number: 1, head: 'bbb' }]
+      cycle(poller, prs, T0, calls)
+      cycle(poller, prs, mins(120), calls)
+      assert_empty calls
+      assert_equal({ 'pr1' => 'bbb' }, poller.state['psp'])
+    end
+  end
+
+  def test_debounce_head_already_reviewed_not_duplicated
+    with_poller do |poller|
+      dir = poller.base_dir
+      rdir = File.join(dir, 'psp', 'review', 'pr1')
+      FileUtils.mkdir_p(rdir)
+      File.write(File.join(rdir, 'metadata.json'), JSON.generate('topic' => 'pr1', 'head_sha' => 'bbb'))
+      proj = [PROJ_D.first.merge(findings_dir: File.join(dir, 'psp', 'findings'))]
+      poller.state['psp'] = { 'pr1' => 'aaa' }
+      calls = []
+      prs = [{ number: 1, head: 'bbb' }]
+      cycle(poller, prs, T0, calls, projects: proj)
+      cycle(poller, prs, mins(120), calls, projects: proj)
+      assert_empty calls
+      assert_equal({ 'pr1' => 'bbb' }, poller.state['psp'])
+    end
+  end
+
   def test_enabled_projects_debounce_minutes
     with_poller do |poller|
       dir = poller.base_dir
