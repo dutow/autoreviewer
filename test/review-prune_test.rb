@@ -1,6 +1,8 @@
 require 'minitest/autorun'
 require 'tmpdir'
 require 'fileutils'
+require 'open3'
+require 'stringio'
 
 load File.expand_path('../bin/review-prune', __dir__)
 
@@ -125,6 +127,63 @@ class ReviewPruneTest < Minitest::Test
       mkdir_aged(File.join(proj(dir, 'pg'), 'review', 'pr1'), 30, file: 'metadata.json')
       pruner(dir).run(out: StringIO.new)
       refute File.exist?(File.join(proj(dir, 'pg'), 'review', 'pr1'))
+    end
+  end
+
+  def log_setup(dir)
+    logs = File.join(dir, 'state', 'logs')
+    mkdir_aged(File.join(logs, 'pg-pr1-v1'), 10, file: '01-a.jsonl')
+    # old dir, fresh phase log inside
+    mkdir_aged(File.join(logs, 'pg-pr1-v2'), 10, file: '01-a.jsonl')
+    FileUtils.touch(File.join(logs, 'pg-pr1-v2', '02-b.jsonl'))
+    mkdir_aged(File.join(logs, 'pg-commits-a-b'), 30, file: 'commits.jsonl')
+    logs
+  end
+
+  def log_pruner(dir, days: 7)
+    ReviewPrune.new(workspace_dir: File.join(dir, 'ws'), state_dir: File.join(dir, 'state'), days: days,
+                    active_windows: [])
+  end
+
+  def test_old_log_dirs_are_candidates
+    with_workspace do |dir|
+      log_setup(dir)
+      assert_equal %w[pg-commits-a-b pg-pr1-v1], log_pruner(dir).log_candidates.map { |c| c[:name] }
+      assert_empty log_pruner(dir, days: 0).log_candidates
+      assert_empty ReviewPrune.new(workspace_dir: dir, days: 7, active_windows: []).log_candidates
+    end
+  end
+
+  def test_run_removes_old_logs_and_dry_run_keeps_them
+    with_workspace do |dir|
+      logs = log_setup(dir)
+      out = StringIO.new
+      assert_equal 2, log_pruner(dir).run(dry_run: true, out: out)
+      assert_match(%r{would remove logs/pg-pr1-v1 \(10d}, out.string)
+      assert_match(%r{would remove logs/pg-commits-a-b \(30d}, out.string)
+      assert_equal %w[pg-commits-a-b pg-pr1-v1 pg-pr1-v2], Dir.children(logs).sort
+
+      out = StringIO.new
+      log_pruner(dir).run(out: out)
+      assert_match(%r{removing logs/pg-pr1-v1}, out.string)
+      assert_equal %w[pg-pr1-v2], Dir.children(logs)
+    end
+  end
+
+  def test_cli_uses_state_dir
+    with_workspace do |dir|
+      logs = log_setup(dir)
+      FileUtils.mkdir_p(File.join(dir, 'ws'))
+      script = File.expand_path('../bin/review-prune', __dir__)
+      env = { 'WORKSPACE_DIR' => File.join(dir, 'ws'), 'STATE_DIR' => File.join(dir, 'state'),
+              'REVIEW_PRUNE_DAYS' => nil }
+      out, st = Open3.capture2e(env, script, '--dry-run')
+      assert st.success?, out
+      assert_match(%r{would remove logs/pg-pr1-v1}, out)
+      assert_equal 3, Dir.children(logs).size
+      out, = Open3.capture2e(env.merge('REVIEW_PRUNE_DAYS' => '0'), script)
+      assert_match(/nothing older than 0 days/, out)
+      assert_equal 3, Dir.children(logs).size
     end
   end
 end

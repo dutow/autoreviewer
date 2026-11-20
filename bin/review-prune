@@ -6,6 +6,8 @@
 # A topic's age is the newest mtime across its builds dir, status.yaml files and
 # review dir, so a re-reviewed topic starts over. Keeps builds/master, builds
 # named after a branches/ checkout, and topics whose review tmux window is open.
+# Also removes runner log dirs (state/logs/<name>/) whose newest file is older
+# than the same cutoff.
 #
 # Usage: review-prune [--dry-run] [--days N]
 
@@ -15,8 +17,9 @@ require 'shellwords'
 class ReviewPrune
   DAY = 86_400
 
-  def initialize(workspace_dir:, days:, active_windows: nil)
+  def initialize(workspace_dir:, days:, state_dir: nil, active_windows: nil)
     @workspace_dir = workspace_dir
+    @state_dir = state_dir
     @days = days.to_i
     @active_windows = active_windows
   end
@@ -42,21 +45,42 @@ class ReviewPrune
     end
   end
 
+  def log_candidates
+    return [] if @days <= 0 || @state_dir.nil?
+    cutoff = Time.now - @days * DAY
+    logs = File.join(@state_dir, 'logs')
+    children(logs).sort.filter_map do |name|
+      dir = File.join(logs, name)
+      next unless File.directory?(dir)
+      newest = ([dir] + Dir.glob(File.join(dir, '**', '*'))).map { |p| File.mtime(p) }.max
+      next unless newest < cutoff
+      { name: name, dir: dir, age_days: ((Time.now - newest) / DAY).floor }
+    end
+  end
+
   def run(dry_run: false, out: $stdout)
     list = candidates
-    if list.empty?
+    logs = log_candidates
+    if list.empty? && logs.empty?
       out.puts "review-prune: nothing older than #{@days} days"
       return 0
     end
+    verb = dry_run ? 'would remove' : 'removing'
     freed = 0
     list.each do |c|
       kb = c[:dirs].sum { |d| size_kb(d) }
       freed += kb
-      out.puts "review-prune: #{dry_run ? 'would remove' : 'removing'} #{c[:project]}/#{c[:topic]} (#{c[:age_days]}d, #{human(kb)})"
+      out.puts "review-prune: #{verb} #{c[:project]}/#{c[:topic]} (#{c[:age_days]}d, #{human(kb)})"
       remove(c) unless dry_run
     end
-    out.puts "review-prune: #{dry_run ? 'would free' : 'freed'} #{human(freed)} from #{list.size} topic(s)"
-    list.size
+    logs.each do |c|
+      kb = size_kb(c[:dir])
+      freed += kb
+      out.puts "review-prune: #{verb} logs/#{c[:name]} (#{c[:age_days]}d, #{human(kb)})"
+      FileUtils.rm_rf(c[:dir]) unless dry_run
+    end
+    out.puts "review-prune: #{dry_run ? 'would free' : 'freed'} #{human(freed)} from #{list.size} topic(s), #{logs.size} log dir(s)"
+    list.size + logs.size
   end
 
   private
@@ -107,5 +131,6 @@ if __FILE__ == $0
   end
   base_dir = File.expand_path('..', __dir__)
   ws = ENV['WORKSPACE_DIR'].to_s.empty? ? File.join(base_dir, 'workspace') : File.expand_path(ENV['WORKSPACE_DIR'])
-  ReviewPrune.new(workspace_dir: ws, days: days).run(dry_run: !dry_run.nil?)
+  state = ENV['STATE_DIR'].to_s.empty? ? File.join(base_dir, 'state') : File.expand_path(ENV['STATE_DIR'])
+  ReviewPrune.new(workspace_dir: ws, state_dir: state, days: days).run(dry_run: !dry_run.nil?)
 end
