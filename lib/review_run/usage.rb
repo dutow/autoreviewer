@@ -26,6 +26,10 @@ module ReviewRun
       @phases << entry(phase, nil, result, started_at, 'failed').merge('reason' => reason)
     end
 
+    def last_status(phase)
+      @phases.reverse_each.find { |p| p['phase'] == phase }&.fetch('status', nil)
+    end
+
     def write
       FileUtils.mkdir_p(File.dirname(@path))
       File.write(@path, JSON.pretty_generate(to_h) + "\n")

@@ -85,6 +85,21 @@ class UsageTest < Minitest::Test
     end
   end
 
+  def test_last_status_is_latest_record_of_phase
+    with_path do |path|
+      u = ReviewRun::Usage.new(path: path, route: 'single', claude_version: '1')
+      u.add(phase: 'a', model: 'opus', result: result(1.0, 100, 1), started_at: T0)
+      u.fail(phase: 'b', reason: 'x', started_at: T0)
+      u.write
+      u2 = ReviewRun::Usage.new(path: path, route: 'single', claude_version: '1')
+      assert_equal 'ok', u2.last_status('a')
+      assert_equal 'failed', u2.last_status('b')
+      assert_nil u2.last_status('c')
+      u2.add(phase: 'b', model: 'opus', result: result(1.0, 100, 1), started_at: T0)
+      assert_equal 'ok', u2.last_status('b')
+    end
+  end
+
   def test_append_log_writes_jsonl
     Dir.mktmpdir do |d|
       log = File.join(d, 'sub', 'usage.log')

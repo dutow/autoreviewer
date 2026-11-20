@@ -46,9 +46,11 @@ module ReviewRun
       say "=== review #{project}/#{topic} v#{rv.version}, route #{rv.route}, #{rv.phases.size} phases"
 
       rv.phases.each_with_index do |phase, idx|
-        if (why = skip_reason(phase, outdir_abs))
+        if (why = skip_reason(phase, outdir_abs, usage))
           say "skip #{phase.name}: #{why}"
-          next
+          next if commit_output(rv, phase)
+
+          return fail_review(project, topic, "could not commit #{File.join(rv.outdir, phase.output)}")
         end
         return false unless run_phase(rv, phase, idx, usage)
       end
@@ -103,10 +105,20 @@ module ReviewRun
                   prev_dir: rv.prev_dir, index: idx + 1, total: rv.phases.size)
     end
 
-    def skip_reason(phase, outdir_abs)
-      return "#{phase.output} exists" if phase.output && File.exist?(File.join(outdir_abs, phase.output))
+    # resume: output present and last run of the phase did not fail
+    def skip_reason(phase, outdir_abs, usage)
+      if phase.output && File.exist?(File.join(outdir_abs, phase.output)) &&
+         usage.last_status(phase.name) != 'failed'
+        return "#{phase.output} exists"
+      end
 
       'skip_if matched' if phase.skip?(outdir_abs)
+    end
+
+    def commit_output(rv, phase)
+      return true unless phase.output
+
+      commit([File.join(rv.outdir, phase.output)], "review(#{rv.topic}): #{phase.name} output (runner)")
     end
 
     def run_phase(rv, phase, idx, usage)
@@ -139,7 +151,7 @@ module ReviewRun
       file = File.join(rv.outdir, phase.output)
       return "output #{file} missing" unless File.exist?(File.join(@workspace_dir, file))
 
-      commit([file], "review(#{rv.topic}): #{phase.name} output (runner)") ? nil : "could not commit #{file}"
+      commit_output(rv, phase) ? nil : "could not commit #{file}"
     end
 
     def exit_desc(status)
@@ -165,6 +177,7 @@ module ReviewRun
             nil
           end
           stdin.close
+          io.set_encoding(Encoding::UTF_8)
           io.each_line do |line|
             lf.write(line)
             lf.flush

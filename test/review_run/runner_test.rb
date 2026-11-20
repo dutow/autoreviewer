@@ -179,6 +179,8 @@ class RunnerTest < Minitest::Test
     assert run_topic, output
     assert_equal %w[b c], calls.map { |c| c['phase'] }
     assert_equal %w[b c], usage['phases'].map { |p| p['phase'] }
+    assert_equal '', dirty("#{OUT_REL}/a.md")
+    assert_includes git('log', '--format=%s'), 'review(t1): a output (runner)'
   end
 
   def test_missing_output_fails_and_stops
@@ -207,6 +209,11 @@ class RunnerTest < Minitest::Test
     b = usage['phases'].last
     assert_equal 'failed', b['status']
     assert_match(/no result/, b['reason'])
+
+    plan(default_plan)
+    assert run_topic, output
+    assert_equal %w[a b b c], calls.map { |c| c['phase'] }
+    assert_equal %w[ok failed ok ok], usage['phases'].map { |p| p['status'] }
   end
 
   def test_nonzero_exit_fails
@@ -266,13 +273,20 @@ class RunnerTest < Minitest::Test
 
   def test_git_lock_gives_up
     plan(default_plan.merge('a' => { 'write' => ['a.md'], 'commit' => false }))
-    File.write(File.join(@ws, '.git', 'index.lock'), '')
+    lock = File.join(@ws, '.git', 'index.lock')
+    File.write(lock, '')
     refute run_topic
     assert_equal %w[a], calls.map { |c| c['phase'] }
     assert(@slept.all? { |s| s == 2 })
     assert_includes output, 'retry 5/5'
     refute_includes output, 'retry 6/'
     assert_match(/FAILED: phase a: could not commit .*a\.md/, output)
+
+    FileUtils.rm_f(lock)
+    assert run_topic, output
+    assert_equal %w[a a b c], calls.map { |c| c['phase'] }
+    assert_equal '', dirty("#{OUT_REL}/a.md")
+    assert_equal '', dirty('p/findings')
   end
 
   def test_warns_on_api_key
@@ -327,6 +341,15 @@ class RunnerTest < Minitest::Test
     out, st = cli('--done-file', done, 'p', 't1')
     refute st.success?, out
     assert File.exist?(done)
+  end
+
+  def test_cli_non_ascii_stream_under_c_locale
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'text' => "caf\u00e9 \u2014 ok" }))
+    out, st = Open3.capture2e({ 'WORKSPACE_DIR' => @ws, 'STATE_DIR' => @state, 'CLAUDE_BIN' => FAKE,
+                                'TMUX' => nil, 'LC_ALL' => 'C', 'LANG' => 'C' },
+                              CLI, 'p', 't1', chdir: @root)
+    assert st.success?, out
+    assert_equal %w[ok ok ok], usage['phases'].map { |p| p['status'] }
   end
 
   def test_cli_render
