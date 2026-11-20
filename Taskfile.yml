@@ -64,6 +64,7 @@ tasks:
     requires: { vars: [NAME] }
     cmds:
       - test ! -e workspace/{{.NAME}}
+      - test ! -e workspace/.claude/review-phases/{{.NAME}}
       - cp -r workspace/_template workspace/{{.NAME}}
       - sed -i 's/CHANGEME/{{.NAME}}/g' workspace/{{.NAME}}/project.yaml
       - mkdir -p workspace/.claude/commands/{{.NAME}}
