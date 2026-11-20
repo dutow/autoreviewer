@@ -23,6 +23,12 @@ module ReviewRun
       nil
     end
 
+    def by
+      JSON.parse(File.read(@path))['by']
+    rescue StandardError
+      nil
+    end
+
     # removes the file once past, or when corrupt
     def active?(now)
       return false unless File.exist?(@path)

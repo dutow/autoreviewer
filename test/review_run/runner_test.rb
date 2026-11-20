@@ -334,6 +334,73 @@ class RunnerTest < Minitest::Test
     refute File.exist?(outdir('c.md'))
   end
 
+  RANGE = 'abcdef1234567..1234567abcdef'.freeze
+
+  def setup_commits
+    File.write(File.join(@ws, 'p', 'project.yaml'), "name: p\nreview:\n  phases: p\ncommit_review:\n  command: ns:rev\n")
+    dir = File.join(@ws, '.claude', 'commands', 'ns')
+    FileUtils.mkdir_p(dir)
+    File.write(File.join(dir, 'rev.md'), "---\ndescription: x\n---\nReview $ARGUMENTS now\n")
+  end
+
+  def run_commits(**kw)
+    r = runner(**kw)
+    ok = nil
+    capture_io { ok = r.run_commits(project: 'p', range: RANGE) }
+    ok
+  end
+
+  def test_commits_mode_logs_usage_only
+    setup_commits
+    assert run_commits, output
+    assert_equal %w[commits], calls.map { |c| c['phase'] }
+    assert_includes calls.first['argv'], 'opus'
+    assert_equal 1, usage_log.size
+    e = usage_log.first
+    assert_equal ['p', RANGE, nil, 'commits', 'commits', 'opus', 'ok', 0.5],
+                 e.values_at('project', 'topic', 'version', 'route', 'phase', 'model', 'status', 'cost_usd')
+    assert File.exist?(File.join(@state, 'logs', 'p-commits-abcdef1-1234567', 'commits.jsonl'))
+    refute File.exist?(File.join(@ws, 'p', 'findings'))
+  end
+
+  def test_commits_mode_failure_and_missing_command
+    setup_commits
+    plan('commits' => { 'exit' => 1 })
+    refute run_commits
+    assert_equal ['failed'], usage_log.map { |l| l['status'] }
+    File.write(File.join(@ws, 'p', 'project.yaml'), "name: p\n")
+    refute run_commits
+    assert_includes output, 'commit_review.command'
+  end
+
+  def test_commits_mode_limit_pauses_with_own_window
+    setup_commits
+    plan('commits' => { 'limit_first' => true, 'limit_text' => LIMIT_TEXT })
+    seen = []
+    ok = run_commits(clock: -> { NOW }, sleeper: ->(s) { @slept << s; seen << JSON.parse(File.read(pause_file)) })
+    assert ok, output
+    assert_equal [1120], @slept
+    assert_equal 'p-commits-abcdef1-1234567', seen.first['by']
+    refute File.exist?(pause_file)
+    assert_equal %w[limit ok], usage_log.map { |l| l['status'] }
+  end
+
+  def test_foreign_pause_left_in_place
+    limit_plan('limit_first' => true)
+    sleeper = lambda do |s|
+      @slept << s
+      ReviewRun::Pause.new(pause_file).set(Time.at(LIMIT_EPOCH + 5000), by: 'other-window')
+    end
+    assert run_topic(clock: -> { NOW }, sleeper: sleeper), output
+    assert_equal 'other-window', JSON.parse(File.read(pause_file))['by']
+  end
+
+  def test_past_reset_still_waits_floor
+    limit_plan('limit_first' => true, 'limit_text' => "Claude AI usage limit reached|#{LIMIT_EPOCH - 1500}")
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [300], @slept
+  end
+
   def test_limit_reset_unparsable_waits_an_hour
     limit_plan('limit_first' => true, 'limit_text' => 'Claude AI usage limit reached, resets 3:75pm')
     assert run_topic(clock: -> { NOW }), output
@@ -394,6 +461,13 @@ class RunnerTest < Minitest::Test
     assert File.exist?(done)
     assert_equal [false, false, false], calls.map { |c| c['done_file_env'] }
     assert File.exist?(outdir('metadata.json'))
+  end
+
+  def test_cli_commits
+    setup_commits
+    _out, st = cli('--commits', 'p', RANGE)
+    assert st.success?
+    assert_equal %w[commits], calls.map { |c| c['phase'] }
   end
 
   def test_cli_failure_touches_done_file

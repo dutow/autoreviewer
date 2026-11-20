@@ -20,11 +20,13 @@ module ReviewRun
     LIMIT_RETRIES = 5
     LIMIT_GRACE = 120
     LIMIT_FALLBACK_WAIT = 3600
+    LIMIT_MIN_WAIT = 300
     CHILD_ENV = Session::CHILD_ENV
     API_KEY_WARNING = 'WARNING: ANTHROPIC_API_KEY is set; claude -p will bill the API key'.freeze
 
     Review = Struct.new(:project, :topic, :version, :route, :yaml, :manifest, :phases,
-                        :outdir, :prev_dir, keyword_init: true)
+                        :outdir, :prev_dir, :window, keyword_init: true)
+    CommitPhase = Struct.new(:name, :model, :effort)
 
     def initialize(base_dir:, workspace_dir:, state_dir:, claude_bin: 'claude', out: $stdout,
                    sleeper: ->(s) { sleep s }, clock: -> { Time.now })
@@ -65,6 +67,29 @@ module ReviewRun
       fail_review(project, topic, msg)
     end
 
+    def run_commits(project:, range:)
+      warn_api_key
+      from, to = range.split('..', 2)
+      raise RunError, "bad range #{range.inspect}, expected FROM..TO" if from.to_s.empty? || to.to_s.empty?
+
+      window = "#{project}-commits-#{from[0, 7]}-#{to[0, 7]}"
+      rv = Review.new(project: project, topic: range, version: nil, route: 'commits', window: window)
+      phase = CommitPhase.new('commits', 'opus', nil)
+      prompt = Prompt.render_command(path: commit_command_path(project), args: range)
+      log = File.join(@state_dir, 'logs', window, 'commits.jsonl')
+      say "=== commit review #{project} #{range}, model opus"
+      _started, result, status, reason = run_past_limit(rv, phase, prompt, log)
+      reason ||= commits_failure(result, status)
+      log_usage(rv, phase, reason ? 'failed' : 'ok', result)
+      return fail_review(project, window.delete_prefix("#{project}-"), reason) if reason
+
+      say "=== commit review #{project} #{range} done"
+      true
+    rescue StandardError => e
+      msg = e.is_a?(RunError) ? e.message : "#{e.class}: #{e.message} (#{e.backtrace&.first})"
+      fail_review(project, 'commits', msg)
+    end
+
     def render(project:, topic:, phase:, route: nil)
       rv = load_review(project, topic, route)
       idx = rv.phases.index { |p| p.name == phase }
@@ -101,8 +126,32 @@ module ReviewRun
       prev = FindingsDir.previous_version(project_dir: project_dir(project), topic: topic, version: version)
       Review.new(project: project, topic: topic, version: version, route: route, yaml: yaml,
                  manifest: manifest, phases: manifest.route(route),
-                 outdir: File.join(project, 'findings', topic, "v#{version}"),
+                 outdir: File.join(project, 'findings', topic, "v#{version}"), window: "#{project}-#{topic}",
                  prev_dir: prev && File.join(project, prev))
+    end
+
+    def commit_command_path(project)
+      yaml = File.join(project_dir(project), 'project.yaml')
+      raise RunError, "project.yaml not found: #{yaml}" unless File.exist?(yaml)
+
+      command = (YAML.safe_load_file(yaml) || {}).dig('commit_review', 'command')
+      raise RunError, "#{yaml}: commit_review.command not set" if command.to_s.empty?
+
+      ns, name = command.split(':', 2)
+      raise RunError, "commit_review.command #{command.inspect} is not <ns>:<name>" if name.to_s.empty?
+
+      path = File.join(@workspace_dir, '.claude', 'commands', ns, "#{name}.md")
+      raise RunError, "command file not found: #{path}" unless File.exist?(path)
+
+      path
+    end
+
+    def commits_failure(result, status)
+      return "no result event (#{exit_desc(status)})" unless result
+      return "claude error (#{result.subtype}): #{result.text[0, 300]}" if result.is_error
+      return "claude #{exit_desc(status)}" unless status&.success?
+
+      nil
     end
 
     def context(rv, idx)
@@ -170,13 +219,13 @@ module ReviewRun
         started = @clock.call
         result, status = run_claude(prompt, phase, log)
         unless result&.limit_hit?
-          @pause.clear if hits.positive?
+          @pause.clear if hits.positive? && @pause.by == rv.window
           return [started, result, status, nil]
         end
 
         hits += 1
         until_t = limit_until(result)
-        @pause.set(until_t, by: "#{rv.project}-#{rv.topic}")
+        @pause.set(until_t, by: rv.window)
         return [started, result, status, 'usage limit, retries exhausted'] if hits > LIMIT_RETRIES
 
         log_usage(rv, phase, 'limit', result)
@@ -193,7 +242,7 @@ module ReviewRun
       rescue StandardError
         now + LIMIT_FALLBACK_WAIT
       end
-      reset + LIMIT_GRACE
+      [reset + LIMIT_GRACE, now + LIMIT_MIN_WAIT].max
     end
 
     def run_claude(prompt, phase, log)
