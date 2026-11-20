@@ -15,6 +15,8 @@ build:
 
 review:
   command: pg_tde:review-patch
+  phases: pg_tde
+  route: single
 
 poll:
   enabled: true   # auto-poll open PRs when review-queue runs

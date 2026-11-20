@@ -68,6 +68,8 @@ tasks:
       - sed -i 's/CHANGEME/{{.NAME}}/g' workspace/{{.NAME}}/project.yaml
       - mkdir -p workspace/.claude/commands/{{.NAME}}
       - sed 's/<PROJECT>/{{.NAME}}/g' workspace/.claude/commands/_git-pr/review-patch.md > workspace/.claude/commands/{{.NAME}}/review-patch.md
+      - cp -r workspace/.claude/review-phases/_git-pr workspace/.claude/review-phases/{{.NAME}}
+      - find workspace/.claude/review-phases/{{.NAME}} -type f -exec sed -i 's/<PROJECT>/{{.NAME}}/g' {} +
       - 'echo "created workspace/{{.NAME}} - fill in build config, e.g.: task claude"'
 
   init-master:

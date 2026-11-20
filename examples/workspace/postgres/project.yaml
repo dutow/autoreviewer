@@ -24,6 +24,8 @@ build:
 # Per-project review command, invoked as /<command> <topic>.
 review:
   command: postgres:review-patch
+  phases: postgres
+  route: single
 
 # Poll: no source (not a GitHub-PR project), so this is refresh-only —
 # review-poll fast-forwards the master checkout to origin/master each cycle.

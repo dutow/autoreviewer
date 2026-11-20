@@ -1,9 +1,11 @@
 # Template project config. For a GitHub-PR project, run
 # `task new-project NAME=<name>` - it copies this directory to <name>/ and
-# generates .claude/commands/<name>/review-patch.md from the _git-pr spine.
+# generates .claude/commands/<name>/review-patch.md and
+# .claude/review-phases/<name>/ from the _git-pr spine.
 # For a mailing-list-style project, copy this directory by hand and create
-# .claude/commands/<name>/review-patch.md from
-# .claude/commands/_template/review-patch.md instead.
+# .claude/commands/<name>/review-patch.md and .claude/review-phases/<name>/
+# from .claude/commands/_template/review-patch.md and
+# .claude/review-phases/_template/ instead.
 name: CHANGEME
 # source: owner/repo        # GitHub-PR projects only - required by bin/github-pr
 # topic_prefix: pr           # GitHub-PR projects only - default topic_prefix is 't'
@@ -26,6 +28,8 @@ build:
 
 review:
   command: CHANGEME:review-patch
+  phases: CHANGEME
+  route: single
 
 # Optional: auto-poll open PRs for this project while review-queue runs.
 # Only meaningful for GitHub-PR projects (those with a `source: owner/repo`).

@@ -1,0 +1,30 @@
+---
+default_model: opus
+routes:
+  single:
+  - name: review
+    prompt: "../../commands/pg_tde/review-patch.md"
+    output: 05-summary.md
+  full:
+  - name: overview
+    prompt: 01-overview.md
+    output: 00-overview.md
+  - name: design
+    prompt: 02-design.md
+    output: 01-design-review.md
+    shared: true
+  - name: code
+    prompt: 03-code.md
+    output: 02-code-review.md
+    shared: true
+  - name: validate
+    prompt: 04-validate.md
+    output: 03-review-validated.md
+    shared: true
+  - name: crossref
+    prompt: 05-crossref.md
+    output: 04-pr-discussion-status.md
+  - name: summary
+    prompt: 06-summary.md
+    output: 05-summary.md
+    shared: true

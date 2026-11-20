@@ -19,6 +19,8 @@ build:
 
 review:
   command: psp:review-patch
+  phases: psp
+  route: single
 
 poll:
   enabled: true   # auto-poll open PRs when review-queue runs
