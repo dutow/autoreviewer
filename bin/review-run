@@ -1,0 +1,57 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Headless review: one `claude -p` session per phase of the project's route.
+#   review-run [--done-file PATH] [--route NAME] [--render PHASE] <project> <topic>
+
+require 'optparse'
+require 'fileutils'
+require_relative '../lib/review_run/runner'
+
+$stdout.sync = true
+
+def env_or(name, default)
+  v = ENV[name].to_s
+  v.empty? ? default : v
+end
+
+opts = {}
+parser = OptionParser.new do |o|
+  o.banner = 'usage: review-run [--done-file PATH] [--route NAME] [--render PHASE] <project> <topic>'
+  o.on('--done-file PATH', 'touch PATH when finished (success or failure)') { |v| opts[:done_file] = v }
+  o.on('--route NAME', 'route from phases.yaml (default: review.route, else full)') { |v| opts[:route] = v }
+  o.on('--render PHASE', 'print the rendered prompt of PHASE and exit') { |v| opts[:render] = v }
+end
+
+ok = false
+begin
+  args = parser.parse(ARGV)
+  raise OptionParser::InvalidArgument, 'expected <project> <topic>' unless args.size == 2
+
+  project, topic = args
+  base_dir = File.expand_path('..', __dir__)
+  runner = ReviewRun::Runner.new(
+    base_dir: base_dir,
+    workspace_dir: File.expand_path(env_or('WORKSPACE_DIR', File.join(base_dir, 'workspace'))),
+    state_dir: File.expand_path(env_or('STATE_DIR', File.join(base_dir, 'state'))),
+    claude_bin: env_or('CLAUDE_BIN', 'claude')
+  )
+  if opts[:render]
+    print runner.render(project: project, topic: topic, phase: opts[:render], route: opts[:route])
+    ok = true
+  else
+    ok = runner.run_topic(project: project, topic: topic, route: opts[:route])
+  end
+rescue OptionParser::ParseError => e
+  warn "#{e.message}\n#{parser.help}"
+rescue Interrupt
+  warn 'Interrupted'
+rescue StandardError => e
+  warn "ERROR: #{e.message}"
+ensure
+  if opts[:done_file]
+    FileUtils.mkdir_p(File.dirname(opts[:done_file]))
+    FileUtils.touch(opts[:done_file])
+  end
+end
+exit(ok ? 0 : 1)
