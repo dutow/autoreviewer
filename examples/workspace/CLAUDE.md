@@ -25,4 +25,5 @@ Adding or configuring a project - full layout, `project.yaml`, hook contracts, c
 - Previous review versions are never modified - only the current version is written to.
 - Commit review progress after completing each phase.
 - Findings are generated locally as files only - never posted automatically to GitHub or mailing lists.
-- Session auto-close is handled centrally by a Stop hook in `.claude/settings.json` (touches `$REVIEW_DONE_FILE` when the orchestrator set it) - review commands do not signal completion themselves. The hook signals completion only when no background work is in flight (`background_tasks`/`session_crons` empty), so a session paused waiting on a background agent is not treated as done.
+- Completion is signalled by the runner: `bin/review-run` touches the done file when it ends, so review commands and phases do not signal completion themselves.
+- Each phase of a queued review runs as a separate headless session. A phase must not start background agents or background tasks, and must wait for all its subagents to finish before it ends.

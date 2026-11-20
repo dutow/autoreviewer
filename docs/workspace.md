@@ -24,6 +24,7 @@ At the workspace root:
 - `<name>/findings/` - review output (see below).
 - `Taskfile.yml` - optional per-project task helpers (e.g. the postgres cluster start/stop/psql tasks).
 - `.claude/commands/` - review slash commands, per project, plus the `_git-pr` spine template and `_template` skeleton.
+- `.claude/review-phases/<name>/` - per-project phase manifest (`phases.yaml`), `shared.md` and numbered phase prompts for the review runner, plus the `_git-pr` and `_template` copies (see [adding-a-project.md](adding-a-project.md#review-phases)).
 - `CLAUDE.md` - identity and layout notes for claude sessions run in this workspace (see below).
 - `Dockerfile` - optional, adds project build deps to the queue image (see below).
 - `bin/` - workspace-shared hooks and vendored tools.
@@ -60,9 +61,11 @@ Each version directory is immutable once written: previous versions are never ed
 - `findings.json` - finding counts by severity (`severity.BUG`, `severity.LIKELY_BUG`, ...), plus `post`, `fyi`, `withdrawn`.
   Written by the review command; the web frontend shows and filters on it.
   `bin/findings-metadata --backfill-counts` fills missing ones by parsing `03-review-validated.md`.
-- The review command's phase output files (overview, design review, code review, validated findings, PR discussion cross-reference, summary, `patches/`, `tests/`, `discussion.txt`).
+- `usage.json` - written by `bin/review-run` after the last phase and committed: route, claude version, per-phase model, tokens, cost and duration, and totals.
+  The webapp shows the cost.
+- The review's phase output files (overview, design review, code review, validated findings, PR discussion cross-reference, summary, `patches/`, `tests/`, `discussion.txt`).
 
-The agent commits review progress after completing each phase - so a review's history is visible in the workspace's git log, not just its final state.
+The runner commits each phase's output (the agent usually commits it first) - so a review's history is visible in the workspace's git log, not just its final state.
 
 ## The workspace Dockerfile pattern
 
@@ -84,7 +87,7 @@ See `examples/workspace/Dockerfile` for the Postgres/meson build-dependency list
 
 ## CLAUDE.md identity block
 
-`CLAUDE.md` at the workspace root is read by every claude session run in the workspace (interactive `task claude` and queued reviews alike).
+`CLAUDE.md` at the workspace root is read by every claude session run in the workspace (interactive `task claude` and every phase session of a queued review alike).
 Fill in the identity block at the top: who you are, which forge/mailing-list identity the reviews feed under, and any per-community conventions worth the agent knowing up front.
 See `examples/workspace/CLAUDE.md` for the placeholder and the rest of the layout notes it documents.
 

@@ -1,6 +1,6 @@
 # Setup
 
-Covers: requirements, `.env`, first-time claude login, GitHub token for PR ingestion, podman, deploy keys and auto-push, webapp deployment, stopping/lifecycle, backups, debugging.
+Covers: requirements, `.env`, first-time claude login, GitHub token for PR ingestion, podman, deploy keys and auto-push, webapp deployment, the review runner, stopping/lifecycle, backups, debugging.
 
 Does not cover: adding a project (see [adding-a-project.md](adding-a-project.md)) or the workspace repo contract (see [workspace.md](workspace.md)).
 
@@ -59,6 +59,12 @@ The image seeds `~/.claude/settings.json` (theme, and `skipDangerousModePermissi
 The seed only lands when the `home` volume is created empty (that's when the volume copies image content). If you already have a `home` volume from an earlier build, it won't pick up the file - remove the volume and re-run `task login`, or write the file by hand: `task shell` then `printf '{"theme":"dark","skipDangerousModePermissionPrompt":true}' > ~/.claude/settings.json`.
 
 The workspace trust dialog ("do you trust the files in this folder?") does not appear for reviews (bypass-permissions mode skips it). It can still show once on interactive `task claude` / `task shell` in a directory you haven't opened before; accept it once and it persists in the `home` volume.
+
+### API key warning
+
+`ANTHROPIC_API_KEY` must not be set in the queue's environment.
+With the key set, `claude -p` bills the API key instead of your subscription.
+The runner prints `WARNING: ANTHROPIC_API_KEY is set; claude -p will bill the API key` at the start of a run, and keeps going.
 
 ## GitHub token for PR ingestion
 
@@ -146,6 +152,61 @@ Names may use letters, digits, `_`, `-` and `.`, but not start with a dot, so do
 HTML in there runs on the same origin as the review app, so its scripts can act with your session:
 only put html there that you wrote or read.
 
+## Review runner
+
+The queue starts each review as `bin/review-run --done-file <signal> <project> <topic>` in its tmux window.
+Commit reviews run as `bin/review-run --done-file <signal> --commits <project> <from>..<to>`.
+The runner runs one headless `claude -p` session per phase of the project's route (see [adding-a-project.md](adding-a-project.md#review-phases)), with `--dangerously-skip-permissions` and `AskUserQuestion` disallowed.
+It touches the done file when it ends, success or failure, so the window closes the same way as before.
+Phase sessions do not get `REVIEW_DONE_FILE`, so the workspace Stop hook does nothing in them.
+
+`CLAUDE_BIN` sets the claude binary the runner calls (default `claude`).
+`WORKSPACE_DIR` and `STATE_DIR` override the workspace and state paths, as for the queue.
+
+Each phase output is committed in the workspace, and `usage.json` is committed after the last phase.
+A failed phase stops the review, prints `FAILED: <reason>`, and opens a tmux window `FAIL-<project>-<topic>` with the message.
+
+### Logs and usage
+
+- `state/logs/<window>/<NN>-<phase>.jsonl` - the raw stream-json output of each phase session, appended on every run.
+  `<window>` is `<project>-<topic>`, or `<project>-commits-<from>-<to>` for commit reviews (the file there is `commits.jsonl`).
+- `state/usage.log` - one JSON line per finished or limit-interrupted phase: time, project, topic, version, route, phase, model, status (`ok`, `failed`, `limit`), cost and tokens.
+- `<project>/findings/<topic>/vNN/usage.json` - committed with the findings: route, claude version, per-phase tokens, cost and duration, and totals.
+  The webapp shows the cost on the review.
+
+### Usage limit pause
+
+When a phase hits the claude usage limit, the runner writes `state/paused` (the reset time plus a two minute margin, and the window that set it), waits, and runs the phase again.
+It gives up after 5 retries and fails the review.
+While `state/paused` is in the future the queue starts no new review; it prints `paused until ... (usage limit)` once and polls every 30 seconds.
+The runner removes the file after a successful retry.
+The queue removes it once the time has passed, or when it is corrupt.
+To lift a pause by hand, delete `state/paused`.
+
+### Resume
+
+Re-running a review for the same topic and version continues where it stopped.
+A phase is skipped when its output file already exists and its last run in `usage.json` did not fail; a skipped phase's output is still committed.
+A phase whose last run failed is run again, even if it left an output file.
+To redo a phase, delete its output file.
+
+### Running by hand
+
+From the workspace directory, inside the container (`task shell`):
+
+```
+../bin/review-run <project> <topic>
+../bin/review-run --route full <project> <topic>
+../bin/review-run --render design <project> <topic>
+../bin/review-run --commits <project> <from>..<to>
+```
+
+`--route NAME` overrides `review.route`.
+`--render PHASE` prints the prompt that phase would get and exits, without calling claude.
+`--done-file PATH` touches `PATH` when the run ends; the queue uses it, you normally do not.
+The topic must already be ingested (`review/<topic>/metadata.json` exists).
+Exit status is 0 on success, 1 on failure.
+
 ## Pruning old builds and worktrees
 
 Builds and review worktrees pile up: a postgres topic is a few GB, so a few months of reviews fill a disk.
@@ -167,7 +228,7 @@ A pruned topic can always be reviewed again: `task enqueue` re-ingests and rebui
 ## Stopping and lifecycle
 
 `task down` is **not graceful** to in-flight reviews: it kills the tmux server, which kills any running claude session mid-review.
-This is accepted - reviews are resumable, and re-enqueueing the same topic picks up review progress from committed findings.
+This is accepted - reviews are resumable, and re-enqueueing the same topic skips the phases that already finished (see [Resume](#resume)).
 There is no drain/wait step.
 
 Preflight failures (missing workspace, claude not logged in, etc.) park the `review-queue` container on `sleep infinity` instead of crash-looping, with the failing checks printed.
@@ -183,6 +244,7 @@ That's your backup; the volumes are convenience state, not sources of truth.
 ## Debugging
 
 - `task attach` - attach to the `reviews` tmux session (Ctrl-b d to detach).
+- `state/logs/<window>/` - raw per-phase logs of the runner; `state/usage.log` - cost per phase.
 - `task shell PROJ=<name>` - shell in the container, in `workspace/<name>` (omit `PROJ` for `workspace/` itself).
 - `task logs` - tail queue + webapp container logs.
 - `task doctor` - run the same preflight checks the queue runs at startup (`.env` present, `workspace/` present, `bin/review-queue --check`).

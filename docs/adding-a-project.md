@@ -19,7 +19,13 @@ build:
   queue_configs: [<config>...] # configs the orchestrator builds per topic
 review:
   command: <name>:review-patch # slash command, see .claude/commands/<name>/
+  phases: <name>               # phase dir under .claude/review-phases/ (see Review phases)
+  route: single                # route in its phases.yaml: single (default in the examples) or full
 ```
+
+`review.phases` is required for the headless runner.
+A project without it is still launched as an interactive claude session running `review.command`, with a warning in the queue log.
+`review.route` defaults to `full` when unset.
 
 ## Hook resolution
 
@@ -55,12 +61,12 @@ Must build `<topic>` using `<config>` (a file under `<name>/configs/`) into `<na
 
 ## Steps to add a project
 
-1. `task new-project NAME=<name>` - copies `_template/` to `workspace/<name>/` (substituting `CHANGEME` for `<name>` in `project.yaml`) and generates `workspace/.claude/commands/<name>/review-patch.md` from the `_git-pr` spine template (substituting `<PROJECT>`).
-2. Edit `workspace/<name>/project.yaml`: `base_branch`, `ingestion.hook`, `build.hook`/`default_config`/`queue_configs`, `review.command`.
+1. `task new-project NAME=<name>` - copies `_template/` to `workspace/<name>/` (substituting `CHANGEME` for `<name>` in `project.yaml`), generates `workspace/.claude/commands/<name>/review-patch.md` from the `_git-pr` spine template (substituting `<PROJECT>`), and copies `workspace/.claude/review-phases/_git-pr/` to `workspace/.claude/review-phases/<name>/` (substituting `<PROJECT>`).
+2. Edit `workspace/<name>/project.yaml`: `base_branch`, `ingestion.hook`, `build.hook`/`default_config`/`queue_configs`, `review.command`, `review.phases`, `review.route`.
    For a GitHub-PR project also add `source: <owner/repo>` and `topic_prefix: pr` (see below).
 3. Add build configs under `workspace/<name>/configs/`.
 4. Provide the build hook: reuse a `bin/` hook or add a project-local one.
-5. Fill in the review command's marked regions (review context, review criteria, test-case kind, validation environment) - see drift check below for GitHub-PR projects; mailing-list-style projects hand-edit `.claude/commands/<name>/review-patch.md` directly.
+5. Fill in the review command's marked regions (review context, review criteria, test-case kind, validation environment), and the same regions in the phase files - see drift check below for GitHub-PR projects; mailing-list-style projects hand-edit `.claude/commands/<name>/review-patch.md` directly.
 6. Seed the master checkout. GitHub-PR projects create `master/` automatically at ingest time (see the github-pr contract below), so skip this. Mailing-list projects (postgres-style) need it before the first ingest: set `clone_url` in `project.yaml` and run `task init-master PROJ=<name>` - a one-shot, idempotent clone into `workspace/<name>/master`.
 7. `task claude` - opens an interactive claude session in the workspace, cwd `workspace/`.
    Use it to develop and verify the build hook against a real topic before wiring it into the queue.
@@ -69,11 +75,72 @@ Must build `<topic>` using `<config>` (a file under `<name>/configs/`) into `<na
 ### Completion signal (auto-close)
 
 The orchestrator runs each review in a tmux window and arms a watcher that closes the window ~120s after a sentinel file appears.
-The window's shell gets the sentinel path in `$REVIEW_DONE_FILE`.
+The window runs `bin/review-run --done-file <sentinel> ...`, and the runner touches the sentinel when it ends, success or failure.
+A new review command or phase needs no completion step of its own.
 
-Touching it is handled centrally by a `Stop` hook in `workspace/.claude/settings.json`, which fires when the session's turn ends - normal completion or an error-exit alike - so the window closes either way.
-A usage-limit pause does not end the turn, so it does not fire the hook: the review stays open and resumes when the limit resets.
-A new review command needs no completion step of its own.
+The workspace `Stop` hook in `workspace/.claude/settings.json` touches `$REVIEW_DONE_FILE` only when that variable is set.
+That is the case just for the interactive fallback (a project without `review.phases`).
+Phase sessions run without it, so one finished phase never closes the window.
+
+A usage-limit hit does not end the review: the runner waits for the reset and retries (see [setup.md](setup.md#usage-limit-pause)).
+
+## Review phases
+
+The runner reads the phase definitions from `workspace/.claude/review-phases/<name>/`, where `<name>` is `review.phases`:
+
+- `phases.yaml` - the manifest.
+- `shared.md` - text prepended to the prompt of every phase with `shared: true` (review context for the project).
+- numbered phase files, `01-overview.md` ... - one prompt per phase.
+
+Each phase runs as its own headless `claude -p` session.
+The prompt is a header (project, topic, version, phase, output directory, review worktree, previous reviewed version) followed by `shared.md` (if the phase asks for it) and the phase file.
+Phase files may start with frontmatter, which is dropped.
+`$ARGUMENTS` (the topic), `$OUTDIR` (the findings dir) and `$PROJECT` are replaced in the text.
+The header tells the phase to run only that phase, not to start background agents or background tasks, and to wait for every subagent before it ends.
+
+### phases.yaml
+
+```yaml
+default_model: opus            # optional; per-phase `model` overrides
+default_effort: high           # optional; per-phase `effort` overrides
+routes:
+  single:                      # the old one-session command, run headless
+  - name: review
+    prompt: "../../commands/<name>/review-patch.md"
+    output: 05-summary.md
+  full:                        # one session per phase
+  - name: overview
+    prompt: 01-overview.md     # relative to this dir
+    output: 00-overview.md     # file in the findings dir
+  - name: design
+    prompt: 02-design.md
+    output: 01-design-review.md
+    shared: true               # prepend shared.md
+  - name: reply
+    prompt: 07-reply.md
+    output: 06-reply-draft.md
+    skip_if:                   # skip when this file matches
+      file: 05-summary.md
+      match: "^\\*\\*Post:\\*\\* (nothing to post|moot)"
+```
+
+Phase keys: `name` and `prompt` (required, `name` unique within a route), `output`, `model`, `effort`, `shared`, `skip_if` (`file` in the findings dir plus a `match` regexp).
+A missing prompt file, a duplicate phase name or an unknown route fails the run before claude starts.
+
+After a phase ends, `output` must exist in the findings dir, or the phase fails.
+The runner commits it if the phase did not.
+A failed phase stops the review.
+The runner calls `bin/findings-metadata` (which writes `metadata.json` in the findings dir) at the start and the end of the run.
+
+### Routes
+
+- `single` - the existing review command run as one headless session.
+  The phase's `prompt` points at the command file, so the review behaves as before, and the run still gets logs and `usage.json`.
+- `full` - one session per phase, each with a focused prompt.
+  It is off until a quality check against `single` shows the findings hold up, so the examples set `route: single`.
+
+Switch a project by changing `review.route`, or try one run with `bin/review-run --route full <project> <topic>` (see [setup.md](setup.md#running-by-hand)).
+`bin/review-run --render <phase> <project> <topic>` shows the exact prompt a phase gets.
 
 ## Git-PR projects (psp, pg_tde, ...)
 
@@ -101,6 +168,7 @@ Requires `gh` authenticated (`gh auth login` or `GH_TOKEN`).
 ### Command template and drift check
 
 The per-project review commands under `workspace/.claude/commands/<name>/review-patch.md` are hand-maintained copies of `workspace/.claude/commands/_git-pr/review-patch.md`.
+The phase dirs `workspace/.claude/review-phases/<name>/` are copies of `workspace/.claude/review-phases/_git-pr/` and follow the same rules.
 Only the regions between `<!-- project-specific:start -->` and `<!-- project-specific:end -->` markers may differ per project; everything else - the spine - must match the template with `<PROJECT>` substituted.
 
 There are **four** marked regions, in file order:
@@ -118,11 +186,13 @@ The template holds placeholders in all four; each project holds the real content
 
 `bin/check-command-drift` verifies this (exit 1 + diff on drift).
 It derives the list of projects to check by scanning `workspace/*/project.yaml` for `ingestion.hook: github-pr` - no hardcoded project list to maintain.
-It compares each against the spine template at `workspace/.claude/commands/_git-pr/review-patch.md`, and runs automatically (non-fatal, warning only) at `review-queue` startup, so drift surfaces without a separate CI step.
+It compares each against the spine template at `workspace/.claude/commands/_git-pr/review-patch.md`.
+It also compares every file in the project's phase dir against the same file in `review-phases/_git-pr/` (spine only, `<PROJECT>` substituted), and reports a missing phase dir or file (`MISSING`) and a file the template does not have (`EXTRA`) as drift.
+The check runs automatically (non-fatal, warning only) at `review-queue` startup, so drift surfaces without a separate CI step.
 
-When editing the review pipeline, edit the template first, propagate to each project command, and rerun the check (`bin/check-command-drift`).
+When editing the review pipeline, edit the templates first (the command and the phase files), propagate to each project, and rerun the check (`bin/check-command-drift`).
 
-The postgres commands (`postgres/review-patch.md`, `postgres/review-commits.md`) and the mailing-list skeleton (`_template/review-patch.md`) are hand-maintained and outside the check - mirror spine changes into them manually.
+The postgres commands (`postgres/review-patch.md`, `postgres/review-commits.md`), the postgres phase dir and the mailing-list skeleton (`_template/review-patch.md`) are hand-maintained and outside the check - mirror spine changes into them manually.
 
 ### Cross-project build dependency (pg_tde -> PSP)
 
@@ -228,7 +298,8 @@ When the base-branch refresh pulls in new commits, the poller checks whether to 
 On first enablement, the poller baselines to `HEAD~20`, so the first batch covers up to 20 existing commits.
 
 Each batch enqueues `<project> commits <from>..<to>` with at most `max_batch` commits per session.
-The queue launches the `command` (a slash command like `<name>:review-commits`) directly on the refreshed base checkout - no ingest and no build step.
+The queue launches `bin/review-run --commits <project> <from>..<to>`, which runs the `command` (a slash command like `<name>:review-commits`) as one headless session on the refreshed base checkout - no ingest and no build step.
+Commit reviews always run on opus, have no phases, and log to `state/logs/<project>-commits-<from>-<to>/commits.jsonl` and `state/usage.log`.
 
 The ledger `<name>/commit-reviews.log` (gitignored) records each reviewed commit: one line per commit, format `<timestamp> <sha> CLEAN|FLAGGED <subject>`.
 The poller's own progress is tracked in `state/poll.state`.

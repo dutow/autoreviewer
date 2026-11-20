@@ -41,13 +41,18 @@ task attach                  # watch it work; Ctrl-b d to detach
 ## What happens on enqueue
 
 `task enqueue` appends a line to the queue file.
-The orchestrator picks it up, runs the project's ingestion hook (fetch the patch/PR and normalize its metadata), then its build hook for each configured build config, then launches a `claude` session in a new tmux window running the project's review slash command.
-The review command writes findings to the workspace in phases, committing after each phase.
-When the review signals completion the window auto-closes, and if `AUTO_PUSH=1` the commits are pushed to the workspace's remote.
+The orchestrator picks it up, runs the project's ingestion hook (fetch the patch/PR and normalize its metadata), then its build hook for each configured build config, then starts `bin/review-run` in a new tmux window.
+The runner runs the project's review as a series of headless `claude -p` sessions, one per phase, and commits each phase's output.
+You can watch the formatted stream in the window (`task attach`) but not type into it.
+After the last phase it writes `usage.json` (tokens and cost per phase and model) next to the findings and commits it.
+When the runner finishes, success or failure, it touches the done file, the window auto-closes, and if `AUTO_PUSH=1` the commits are pushed to the workspace's remote.
+
+If the claude usage limit is hit, the runner pauses the queue until the limit resets and then retries the phase (see [docs/setup.md](docs/setup.md#usage-limit-pause)).
+Projects without `review.phases` in `project.yaml` still get an interactive claude session running the review slash command.
 
 ## More docs
 
-- [docs/setup.md](docs/setup.md) - .env reference, podman, deploy keys and auto-push, webapp deployment, stopping/backups/debugging.
-- [docs/adding-a-project.md](docs/adding-a-project.md) - hook contracts, project.yaml schema, PR polling, commit review, drift checking.
+- [docs/setup.md](docs/setup.md) - .env reference, podman, deploy keys and auto-push, webapp deployment, the review runner (logs, usage limit, running by hand), stopping/backups/debugging.
+- [docs/adding-a-project.md](docs/adding-a-project.md) - hook contracts, project.yaml schema, review phases, PR polling, commit review, drift checking.
 - [docs/workspace.md](docs/workspace.md) - the workspace repo contract: what to commit, what's gitignored, findings layout, migrating an old layout.
 - [examples/workspace](examples/workspace) - a working reference workspace (postgres, pg_tde, psp projects) - read it alongside the docs above.
