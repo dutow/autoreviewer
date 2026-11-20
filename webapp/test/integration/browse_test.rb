@@ -226,6 +226,28 @@ class BrowseTest < ActionDispatch::IntegrationTest
     assert_select ".side details.files a", { text: /findings\.json/, count: 0 }
   end
 
+  test "cost column and usage section" do
+    get "/?versions=all"
+    rows = css_select("table.reviews tbody tr")
+    v2 = rows.find { |tr| tr.text.include?("t1") && tr.text.include?("v2") }
+    assert_includes v2.text, "$1.23"
+    v1 = rows.find { |tr| tr.text.include?("t1") && tr.text.include?("v1") }
+    refute_includes v1.text, "$"
+
+    get "/p/alpha/t/t1/v/2/f/00-overview.md"
+    assert_select ".side details.usage"
+    assert_select ".side details.usage li.phase", count: 2
+    assert_select ".side details.usage", text: /1,010 tokens/
+    assert_select ".side details.usage", text: /single/
+    assert_select ".side details.usage", text: /\$1\.23/
+    assert_select ".side details.usage", text: /review opus \$1\.00 ok/
+    assert_select ".side details.usage", text: /validate - \$0\.23 failed/
+    assert_select ".side details.files a", { text: /usage\.json/, count: 0 }
+
+    get "/p/alpha/t/t1/v/1/f/00-overview.md"
+    assert_select ".side details.usage", count: 0
+  end
+
 test "dotted project and topic names route" do
   ReviewsFixture.commit_change(@reviews_dir, "beta/findings/release-2.4.0/v1/00-summary.md", "# Release 2.4.0\n")
   ReviewsFixture.commit_change(@reviews_dir, "gamma.next/project.yaml", "name: gamma.next\n")

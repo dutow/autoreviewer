@@ -82,7 +82,8 @@ class Indexer
         hackorum_url: meta["hackorum_url"],
         reviewed_at: parse_time(meta["reviewed_at"]) || git_time(v.relpath),
         path: v.relpath,
-        **counts_attributes(v.finding_counts)
+        **counts_attributes(v.finding_counts),
+        **usage_attributes(v.usage)
       )
       rv.save! if rv.changed?
 
@@ -117,6 +118,17 @@ class Indexer
     attrs = ReviewVersion::SEVERITIES.to_h { |s| [:"#{s}_count", sev && count(sev[s.upcase])] }
     attrs.merge(post_count: sev && count(c["post"]), fyi_count: sev && count(c["fyi"]),
                 withdrawn_count: sev && count(c["withdrawn"]))
+  end
+
+  def usage_attributes(u)
+    total = u["total"].is_a?(Hash) ? u["total"] : {}
+    cost = total["cost_usd"]
+    tokens = total["tokens"].is_a?(Hash) ? total["tokens"].values.grep(Integer).sum : nil
+    {
+      cost_usd: cost.is_a?(Numeric) ? cost.to_f : nil,
+      total_tokens: tokens,
+      route: u["route"].is_a?(String) ? u["route"] : nil
+    }
   end
 
   def count(v) = v.is_a?(Integer) ? v : 0

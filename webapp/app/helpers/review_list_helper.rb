@@ -24,6 +24,10 @@ module ReviewListHelper
     safe_join(badges, " ")
   end
 
+  def usage_cost(r)
+    r.cost_usd ? format("$%.2f", r.cost_usd) : ""
+  end
+
   def review_row_class(r)
     sev = r.worst_severity
     "row-#{sev.dasherize}" if %w[bug likely_bug].include?(sev)

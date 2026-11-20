@@ -28,6 +28,15 @@ module Reviews
       end
     end
 
+    def usage
+      @usage ||= begin
+        data = JSON.parse(File.read(File.join(dir, "usage.json")))
+        data.is_a?(Hash) ? data : {}
+      rescue Errno::ENOENT, Errno::ENOTDIR, JSON::ParserError
+        {}
+      end
+    end
+
     def files
       Dir.glob(File.join(dir, "**", "*"))
          .select { |p| File.file?(p) && !File.symlink?(p) }

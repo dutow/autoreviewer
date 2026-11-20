@@ -6,6 +6,7 @@ table.reviews
       th Version
       th Title
       th Findings
+      th Cost
       th Reviewed
       th Source
   tbody
@@ -16,6 +17,7 @@ table.reviews
         td = link_to "v#{r.version}", version_path(r.project, r.topic, r.version)
         td = r.title
         td.findings = finding_badges(r)
+        td.cost = usage_cost(r)
         td.date = r.reviewed_at&.strftime("%Y-%m-%d %H:%M")
         td
           - if (u = safe_url(r.source_url))

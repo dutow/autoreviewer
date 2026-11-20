@@ -36,6 +36,27 @@ class IndexerTest < ActiveSupport::TestCase
     end
   end
 
+  test "usage from usage json" do
+    with_reviews_root do |root, dir|
+      Indexer.new(root: root).run
+      v2 = ReviewVersion.find_by!(project: "alpha", topic: "t1", version: 2)
+      assert_in_delta 1.234, v2.cost_usd
+      assert_equal 1010, v2.total_tokens
+      assert_equal "single", v2.route
+      v1 = ReviewVersion.find_by!(project: "alpha", topic: "t1", version: 1)
+      assert_nil v1.cost_usd
+      assert_nil v1.total_tokens
+      assert_nil v1.route
+      refute Document.exists?(relpath: "usage.json")
+
+      ReviewsFixture.commit_change(dir, "alpha/findings/t1/v2/usage.json", '{"total": {"cost_usd": "x", "tokens": []}}')
+      Indexer.new(root: root).run
+      v2.reload
+      assert_nil v2.cost_usd
+      assert_nil v2.route
+    end
+  end
+
   test "fallbacks for version without metadata" do
     with_reviews_root do |root, _|
       Indexer.new(root: root).run

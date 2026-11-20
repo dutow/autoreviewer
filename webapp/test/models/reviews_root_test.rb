@@ -23,6 +23,16 @@ class ReviewsRootTest < ActiveSupport::TestCase
     end
   end
 
+  test "usage parsed and empty when missing" do
+    with_reviews_root do |root, _|
+      t1 = root.project("alpha").topic("t1")
+      assert_equal 1.234, t1.version(2).usage.dig("total", "cost_usd")
+      assert_equal 2, t1.version(2).usage["phases"].size
+      assert_equal({}, t1.version(1).usage)
+      refute t1.version(2).file("usage.json").indexable?
+    end
+  end
+
   test "file classification" do
     with_reviews_root do |root, _|
       v2 = root.project("alpha").topic("t1").version(2)

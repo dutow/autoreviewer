@@ -27,7 +27,7 @@ module Reviews
 
     def language = LANGUAGES[File.extname(abspath).downcase]
 
-    INTERNAL = %w[metadata.json findings.json].freeze
+    INTERNAL = %w[metadata.json findings.json usage.json].freeze
 
     def internal? = INTERNAL.include?(relpath)
 
