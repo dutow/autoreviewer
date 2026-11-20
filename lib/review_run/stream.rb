@@ -40,6 +40,12 @@ module ReviewRun
         format('== result: %s, %d turns, $%.2f, %.1fs', event['subtype'],
                event['num_turns'].to_i, event['total_cost_usd'].to_f,
                event['duration_ms'].to_f / 1000)
+      when 'rate_limit_event'
+        rl = RateLimit.from_event(event)
+        return nil if rl.nil? || rl.status == 'allowed'
+
+        reset = rl.resets_at ? ", resets #{rl.resets_at.strftime('%Y-%m-%d %H:%M')}" : ''
+        "== rate limit #{rl.status} (#{rl.type || '?'})#{reset}"
       end
     end
 
@@ -66,8 +72,26 @@ module ReviewRun
     end
   end
 
+  # rate_limit_event of the stream: {"rate_limit_info": {"status", "resetsAt" (epoch s), "rateLimitType"}}
+  RateLimit = Struct.new(:status, :resets_at, :type) do
+    def self.from_event(event)
+      info = event['rate_limit_info']
+      return nil unless event['type'] == 'rate_limit_event' && info.is_a?(Hash)
+
+      at = info['resetsAt']
+      new(info['status'].to_s, at.is_a?(Numeric) ? Time.at(at.to_i) : nil, info['rateLimitType'])
+    end
+
+    def rejected?
+      status == 'rejected'
+    end
+  end
+
   class Result
-    LIMIT_RE = /usage limit|limit reached|hit your limit/i
+    LIMIT_RE = /You've hit your\b.{0,40}?\blimit/
+    NOT_LIMIT_RE = /not your usage limit|Context limit/i
+    RESET_RE = /resets (?:at )?(?:([A-Z][a-z]{2}) (\d{1,2}), (?:(\d{4}), )?)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i
+    MONTHS = %w[jan feb mar apr may jun jul aug sep oct nov dec].freeze
     TOKEN_KEYS = %w[input output cache_read cache_write].freeze
     USAGE_FIELDS = {
       'input' => 'inputTokens',
@@ -99,21 +123,31 @@ module ReviewRun
     end
 
     def limit_hit?
-      is_error && text.match?(LIMIT_RE)
+      is_error && text.match?(LIMIT_RE) && !text.match?(NOT_LIMIT_RE)
     end
 
+    # "resets 3pm", "resets 3:30pm", "resets Nov 24, 3pm": next such local time; raises on a bad time
     def limit_reset(now)
-      if (m = text.match(/\|(\d{10})/))
-        Time.at(m[1].to_i)
-      elsif (m = text.match(/resets (?:at )?(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i))
-        hour = m[1].to_i % 12
-        hour += 12 if m[3].downcase == 'pm'
-        t = Time.local(now.year, now.month, now.day, hour, m[2].to_i)
-        t += 86400 if t <= now
-        t
-      else
-        now + 3600
-      end
+      m = text.match(RESET_RE)
+      return now + 3600 unless m
+
+      hour = m[4].to_i
+      raise ArgumentError, "bad reset hour in #{m[0].inspect}" unless (1..12).cover?(hour)
+
+      hour = hour % 12 + (m[6].casecmp?('pm') ? 12 : 0)
+      return clock_reset(now, hour, m[5].to_i) unless m[1]
+
+      month = MONTHS.index(m[1].downcase) or raise ArgumentError, "bad reset month in #{m[0].inspect}"
+      t = Time.local(m[3] ? m[3].to_i : now.year, month + 1, m[2].to_i, hour, m[5].to_i)
+      t = Time.local(now.year + 1, month + 1, m[2].to_i, hour, m[5].to_i) if t <= now && !m[3]
+      t
+    end
+
+    private
+
+    def clock_reset(now, hour, min)
+      t = Time.local(now.year, now.month, now.day, hour, min)
+      t <= now ? t + 86_400 : t
     end
   end
 end

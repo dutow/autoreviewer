@@ -1,6 +1,7 @@
 require 'minitest/autorun'
 require 'json'
 require 'tmpdir'
+require 'stringio'
 
 require_relative '../../lib/review_run/stream'
 require_relative '../../lib/review_run/usage'
@@ -97,6 +98,45 @@ class UsageTest < Minitest::Test
       assert_nil u2.last_status('c')
       u2.add(phase: 'b', model: 'opus', result: result(1.0, 100, 1), started_at: T0)
       assert_equal 'ok', u2.last_status('b')
+    end
+  end
+
+  def test_limit_entry_counts_in_totals
+    with_path do |path|
+      u = ReviewRun::Usage.new(path: path, route: 'single', claude_version: '1')
+      refute u.changed?
+      u.limit(phase: 'a', model: 'opus', result: result(0.25, 100, 1), started_at: T0)
+      assert u.changed?
+      u.add(phase: 'a', model: 'opus', result: result(1.0, 200, 2), started_at: T0)
+      u.write
+      d = load_json(path)
+      assert_equal [%w[a limit opus], %w[a ok opus]], d['phases'].map { |p| p.values_at('phase', 'status', 'model') }
+      assert_equal 1.25, d['total']['cost_usd']
+      assert_equal 3, d['total']['tokens']['input']
+      assert_equal 'ok', ReviewRun::Usage.new(path: path, route: 'single', claude_version: '1').last_status('a')
+    end
+  end
+
+  def test_write_is_atomic
+    with_path do |path|
+      u = ReviewRun::Usage.new(path: path, route: 'single', claude_version: '1')
+      u.add(phase: 'a', model: 'opus', result: result(1.0, 100, 1), started_at: T0)
+      u.write
+      assert_equal ['usage.json'], Dir.children(File.dirname(path))
+    end
+  end
+
+  def test_corrupt_file_warns_and_starts_fresh
+    ['{"phases": [', '[1, 2]', '{"phases": "x"}', 'null'].each do |bad|
+      with_path do |path|
+        File.write(path, bad)
+        out = StringIO.new
+        u = ReviewRun::Usage.new(path: path, route: 'single', claude_version: '1', out: out)
+        assert_match(/\AWARNING: .*usage\.json unreadable .*starting fresh\n\z/, out.string, bad)
+        u.add(phase: 'a', model: 'opus', result: result(1.0, 100, 1), started_at: T0)
+        u.write
+        assert_equal %w[a], load_json(path)['phases'].map { |p| p['phase'] }
+      end
     end
   end
 

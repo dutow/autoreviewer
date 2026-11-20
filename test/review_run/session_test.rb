@@ -70,6 +70,7 @@ class SessionTest < Minitest::Test
                     --disallowedTools AskUserQuestion --output-format stream-json --verbose], c['argv']
     assert_equal File.realpath(@dir), File.realpath(c['cwd'])
     assert_equal false, c['done_file_env']
+    assert_equal({ 'REVIEW_RUN' => '1', 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS' => '1' }, c['env'])
   end
 
   def test_no_model_or_effort_flags_when_nil
@@ -80,9 +81,28 @@ class SessionTest < Minitest::Test
 
   def test_limit_result
     plan('a' => { 'limit_first' => true })
-    result, status = run_a
+    result, status, rate_limit = run_a
     assert result.limit_hit?
     assert_equal 1, status.exitstatus
+    assert_nil rate_limit
+  end
+
+  def test_rejected_rate_limit_event_returned
+    plan('a' => { 'limit_first' => true, 'limit_text' => 'API Error: 429',
+                  'limit_event' => { 'status' => 'rejected', 'resetsAt' => 1_800_000_000, 'rateLimitType' => 'five_hour' } })
+    result, _status, rate_limit = run_a
+    refute result.limit_hit?
+    assert rate_limit.rejected?
+    assert_equal Time.at(1_800_000_000), rate_limit.resets_at
+    assert_match(/== rate limit rejected \(five_hour\), resets /, @out.string)
+    assert(File.readlines(@log).any? { |l| l.include?('"type":"rate_limit_event"') })
+  end
+
+  def test_allowed_rate_limit_event_ignored
+    plan('a' => { 'rate_limit' => { 'status' => 'allowed_warning', 'resetsAt' => 1_800_000_000 } })
+    _result, status, rate_limit = run_a
+    assert status.success?
+    assert_nil rate_limit
   end
 
   def test_no_result_event

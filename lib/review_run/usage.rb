@@ -11,28 +11,40 @@ module ReviewRun
       File.open(log_path, 'a') { |f| f.puts(JSON.generate(entry)) }
     end
 
-    def initialize(path:, route:, claude_version:)
+    def initialize(path:, route:, claude_version:, out: $stdout)
       @path = path
       @route = route
       @claude_version = claude_version
-      @phases = File.exist?(path) ? JSON.parse(File.read(path)).fetch('phases', []) : []
+      @phases = load(out)
+      @changed = false
     end
 
     def add(phase:, model:, result:, started_at:)
-      @phases << entry(phase, model, result, started_at, 'ok')
+      record(entry(phase, model, result, started_at, 'ok'))
+    end
+
+    def limit(phase:, model:, result:, started_at:)
+      record(entry(phase, model, result, started_at, 'limit'))
     end
 
     def fail(phase:, reason:, result: nil, started_at:)
-      @phases << entry(phase, nil, result, started_at, 'failed').merge('reason' => reason)
+      record(entry(phase, nil, result, started_at, 'failed').merge('reason' => reason))
     end
 
     def last_status(phase)
       @phases.reverse_each.find { |p| p['phase'] == phase }&.fetch('status', nil)
     end
 
+    # true once a phase was recorded by this instance
+    def changed?
+      @changed
+    end
+
     def write
       FileUtils.mkdir_p(File.dirname(@path))
-      File.write(@path, JSON.pretty_generate(to_h) + "\n")
+      tmp = "#{@path}.#{Process.pid}.tmp"
+      File.write(tmp, JSON.pretty_generate(to_h) + "\n")
+      File.rename(tmp, @path)
     end
 
     def to_h
@@ -42,14 +54,31 @@ module ReviewRun
         'claude_version' => @claude_version,
         'phases' => @phases,
         'total' => {
-          'cost_usd' => @phases.sum { |p| p['cost_usd'] },
-          'duration_ms' => @phases.sum { |p| p['duration_ms'] },
-          'tokens' => TOKEN_KEYS.to_h { |k| [k, @phases.sum { |p| p['tokens'][k] }] }
+          'cost_usd' => @phases.sum { |p| p['cost_usd'].to_f },
+          'duration_ms' => @phases.sum { |p| p['duration_ms'].to_i },
+          'tokens' => TOKEN_KEYS.to_h { |k| [k, @phases.sum { |p| p['tokens'].is_a?(Hash) ? p['tokens'][k].to_i : 0 }] }
         }
       }
     end
 
     private
+
+    def load(out)
+      return [] unless File.exist?(@path)
+
+      phases = JSON.parse(File.read(@path)).fetch('phases', [])
+      raise TypeError, 'phases is not a list of objects' unless phases.is_a?(Array) && phases.all?(Hash)
+
+      phases
+    rescue JSON::ParserError, TypeError, NoMethodError, KeyError, SystemCallError => e
+      out.puts "WARNING: #{@path} unreadable (#{e.message.lines.first&.strip}), starting fresh"
+      []
+    end
+
+    def record(e)
+      @changed = true
+      @phases << e
+    end
 
     def entry(phase, model, result, started_at, status)
       {

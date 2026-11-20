@@ -165,7 +165,7 @@ class RunnerTest < Minitest::Test
     assert_in_delta 0.5, log[0]['cost_usd']
     assert_equal 20, log[0]['tokens']['output']
 
-    raw = File.join(@state, 'logs', 'p-t1', '02-b.jsonl')
+    raw = File.join(@state, 'logs', 'p-t1-v2', '02-b.jsonl')
     assert File.exist?(raw)
     assert(File.readlines(raw).any? { |l| l.include?('"type":"result"') })
     assert_includes output, '== result: success'
@@ -181,6 +181,61 @@ class RunnerTest < Minitest::Test
     assert_equal %w[b c], usage['phases'].map { |p| p['phase'] }
     assert_equal '', dirty("#{OUT_REL}/a.md")
     assert_includes git('log', '--format=%s'), 'review(t1): a output (runner)'
+  end
+
+  def test_resume_reruns_phase_interrupted_by_limit
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('a.md'), "partial\n")
+    File.write(outdir('usage.json'), JSON.generate('phases' => [
+                                                     { 'phase' => 'a', 'status' => 'limit', 'cost_usd' => 0.1, 'duration_ms' => 1,
+                                                       'tokens' => { 'input' => 1, 'output' => 1, 'cache_read' => 0, 'cache_write' => 0 } }
+                                                   ]))
+    assert run_topic, output
+    assert_equal %w[a b c], calls.map { |c| c['phase'] }
+    assert_equal %w[limit ok ok ok], usage['phases'].map { |p| p['status'] }
+  end
+
+  def test_finished_review_without_usage_creates_none
+    FileUtils.mkdir_p(outdir)
+    %w[a.md b.md c.md].each { |f| File.write(outdir(f), "done\n") }
+    git('add', '-f', OUT_REL)
+    git('commit', '-q', '-m', 'old review')
+    assert run_topic, output
+    assert_empty calls
+    refute File.exist?(outdir('usage.json'))
+    assert_empty git('ls-files', "#{OUT_REL}/usage.json")
+    refute_includes git('log', '--format=%s'), 'review(t1): add usage'
+  end
+
+  def test_commit_done_by_other_session_counts_as_success
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'commit' => false }))
+    r = runner
+    ws = @ws
+    r.define_singleton_method(:git) do |*args|
+      return super(*args) unless args.first == 'commit'
+
+      Open3.capture2e('git', 'commit', '-q', '-m', 'other session', '--', *args.drop_while { |a| a != '--' }.drop(1),
+                      chdir: ws)
+      [false, 'nothing added to commit']
+    end
+    ok = nil
+    capture_io { ok = r.run_topic(project: 'p', topic: 't1') }
+    assert ok, output
+    assert_equal %w[a b c], calls.map { |c| c['phase'] }
+    assert_includes git('log', '--format=%s'), 'other session'
+    assert_equal '', dirty('p/findings')
+  end
+
+  def test_commit_failure_with_dirty_path_still_fails
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'commit' => false }))
+    r = runner
+    r.define_singleton_method(:git) do |*args|
+      args.first == 'commit' ? [false, 'hook rejected'] : super(*args)
+    end
+    ok = nil
+    capture_io { ok = r.run_topic(project: 'p', topic: 't1') }
+    refute ok
+    assert_match(/FAILED: phase a: could not commit .*a\.md/, output)
   end
 
   def test_missing_output_fails_and_stops
@@ -229,7 +284,7 @@ class RunnerTest < Minitest::Test
     plan(default_plan.merge('a' => { 'write' => ['a.md'], 'noise' => true }))
     assert run_topic, output
     assert_includes output, 'fake-claude: stderr noise'
-    assert_includes File.read(File.join(@state, 'logs', 'p-t1', '01-a.jsonl')), 'fake-claude: stderr noise'
+    assert_includes File.read(File.join(@state, 'logs', 'p-t1-v2', '01-a.jsonl')), 'fake-claude: stderr noise'
   end
 
   def test_uncommitted_output_committed_by_runner
@@ -243,6 +298,7 @@ class RunnerTest < Minitest::Test
     ENV['REVIEW_DONE_FILE'] = File.join(@root, 'done')
     assert run_topic, output
     assert_equal [false, false, false], calls.map { |c| c['done_file_env'] }
+    assert_equal [{ 'REVIEW_RUN' => '1', 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS' => '1' }] * 3, calls.map { |c| c['env'] }
     refute File.exist?(File.join(@root, 'done'))
   end
 
@@ -290,7 +346,9 @@ class RunnerTest < Minitest::Test
   end
 
   LIMIT_EPOCH = 1_800_000_000
-  LIMIT_TEXT = "Claude AI usage limit reached|#{LIMIT_EPOCH}".freeze
+  DOT = "\u00b7".freeze
+  LIMIT_TEXT = "You've hit your 5-hour limit #{DOT} resets 3pm (Europe/Budapest)".freeze
+  LIMIT_EVENT = { 'status' => 'rejected', 'resetsAt' => LIMIT_EPOCH, 'rateLimitType' => 'five_hour' }.freeze
   NOW = Time.at(LIMIT_EPOCH - 1000)
 
   def pause_file
@@ -298,7 +356,8 @@ class RunnerTest < Minitest::Test
   end
 
   def limit_plan(step)
-    plan(default_plan.merge('b' => { 'write' => ['b.md'], 'limit_text' => LIMIT_TEXT }.merge(step)))
+    plan(default_plan.merge('b' => { 'write' => ['b.md'], 'limit_text' => LIMIT_TEXT,
+                                     'limit_event' => LIMIT_EVENT }.merge(step)))
   end
 
   def test_limit_hit_pauses_and_retries
@@ -313,8 +372,13 @@ class RunnerTest < Minitest::Test
     assert_equal [1120], @slept
     assert_equal [{ 'until' => Time.at(LIMIT_EPOCH + 120).iso8601, 'by' => 'p-t1' }], seen
     refute File.exist?(pause_file)
-    assert_equal %w[a b c], usage['phases'].map { |p| p['phase'] }
-    assert_equal %w[ok ok ok], usage['phases'].map { |p| p['status'] }
+    assert_equal %w[a b b c], usage['phases'].map { |p| p['phase'] }
+    assert_equal %w[ok limit ok ok], usage['phases'].map { |p| p['status'] }
+    lim = usage['phases'][1]
+    assert_equal 'sonnet', lim['model']
+    assert_in_delta 0.01, lim['cost_usd']
+    assert_equal 2, lim['tokens']['output']
+    assert_in_delta 1.51, usage['total']['cost_usd']
     assert_equal %w[ok limit ok ok], usage_log.map { |l| l['status'] }
     assert_match(%r{usage limit in phase b, paused until .* \(retry 1/5\)}, output)
   end
@@ -324,9 +388,9 @@ class RunnerTest < Minitest::Test
     refute run_topic(clock: -> { NOW })
     assert_equal %w[a b b b b b b], calls.map { |c| c['phase'] }
     assert_equal [1120] * 5, @slept
-    a, b, *rest = usage['phases']
-    assert_empty rest
+    a, *lims, b = usage['phases']
     assert_equal 'ok', a['status']
+    assert_equal %w[limit] * 5, lims.map { |l| l['status'] }
     assert_equal ['failed', 'usage limit, retries exhausted'], b.values_at('status', 'reason')
     assert_equal %w[ok limit limit limit limit limit failed], usage_log.map { |l| l['status'] }
     assert_equal Time.at(LIMIT_EPOCH + 120).iso8601, JSON.parse(File.read(pause_file))['until']
@@ -375,7 +439,7 @@ class RunnerTest < Minitest::Test
 
   def test_commits_mode_limit_pauses_with_own_window
     setup_commits
-    plan('commits' => { 'limit_first' => true, 'limit_text' => LIMIT_TEXT })
+    plan('commits' => { 'limit_first' => true, 'limit_text' => LIMIT_TEXT, 'limit_event' => LIMIT_EVENT })
     seen = []
     ok = run_commits(clock: -> { NOW }, sleeper: ->(s) { @slept << s; seen << JSON.parse(File.read(pause_file)) })
     assert ok, output
@@ -396,25 +460,59 @@ class RunnerTest < Minitest::Test
   end
 
   def test_past_reset_still_waits_floor
-    limit_plan('limit_first' => true, 'limit_text' => "Claude AI usage limit reached|#{LIMIT_EPOCH - 1500}")
+    limit_plan('limit_first' => true, 'limit_event' => LIMIT_EVENT.merge('resetsAt' => LIMIT_EPOCH - 1500))
     assert run_topic(clock: -> { NOW }), output
     assert_equal [300], @slept
   end
 
+  def test_limit_text_only_reset_from_text
+    now = Time.local(2026, 11, 20, 13, 0, 0)
+    limit_plan('limit_first' => true, 'limit_event' => nil,
+               'limit_text' => "You've hit your weekly limit #{DOT} resets Nov 24, 3pm (Europe/Budapest)")
+    assert run_topic(clock: -> { now }), output
+    assert_equal [(Time.local(2026, 11, 24, 15, 0, 0) + 120 - now).ceil], @slept
+    assert_equal %w[a b b c], calls.map { |c| c['phase'] }
+  end
+
+  def test_limit_event_only_pauses_until_resets_at
+    limit_plan('limit_first' => true, 'limit_text' => 'API Error: 429 rate_limit_error')
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [1120], @slept
+    assert_equal %w[a b b c], calls.map { |c| c['phase'] }
+  end
+
+  def test_rejected_event_on_successful_run_does_not_pause
+    plan(default_plan.merge('b' => { 'write' => ['b.md'], 'rate_limit' => LIMIT_EVENT }))
+    assert run_topic(clock: -> { NOW }), output
+    assert_empty @slept
+    assert_equal %w[a b c], calls.map { |c| c['phase'] }
+  end
+
   def test_limit_reset_unparsable_waits_an_hour
-    limit_plan('limit_first' => true, 'limit_text' => 'Claude AI usage limit reached, resets 3:75pm')
+    limit_plan('limit_first' => true, 'limit_event' => nil, 'limit_text' => "You've hit your limit #{DOT} resets 3:75pm")
     assert run_topic(clock: -> { NOW }), output
     assert_equal [3600 + 120], @slept
     assert_equal %w[a b b c], calls.map { |c| c['phase'] }
   end
 
+  def test_limit_text_without_reset_waits_an_hour
+    limit_plan('limit_first' => true, 'limit_event' => nil, 'limit_text' => "You've hit your Opus limit")
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [3600 + 120], @slept
+  end
+
   def test_error_without_limit_text_fails_without_pause
-    limit_plan('limit_first' => true, 'limit_text' => 'API Error: 500')
-    refute run_topic
-    assert_equal %w[a b], calls.map { |c| c['phase'] }
-    assert_empty @slept
-    refute File.exist?(pause_file)
-    assert_match(/claude error/, usage['phases'].last['reason'])
+    ['API Error: 500', 'Server is temporarily limiting requests (not your usage limit)',
+     "Context limit reached #{DOT} /compact or /clear to continue"].each do |text|
+      FileUtils.rm_rf(outdir)
+      FileUtils.rm_f(@calls_file)
+      limit_plan('limit_first' => true, 'limit_event' => nil, 'limit_text' => text)
+      refute run_topic, text
+      assert_equal %w[a b], calls.map { |c| c['phase'] }, text
+      assert_empty @slept, text
+      refute File.exist?(pause_file), text
+      assert_match(/claude error/, usage['phases'].last['reason'])
+    end
   end
 
   def test_warns_on_api_key

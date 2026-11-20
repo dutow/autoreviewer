@@ -49,7 +49,8 @@ module ReviewRun
 
       rv.outdir = File.join(project, rel)
       outdir_abs = File.join(@workspace_dir, rv.outdir)
-      usage = Usage.new(path: File.join(outdir_abs, 'usage.json'), route: rv.route, claude_version: @session.version)
+      usage = Usage.new(path: File.join(outdir_abs, 'usage.json'), route: rv.route,
+                        claude_version: @session.version, out: @out)
       say "=== review #{project}/#{topic} v#{rv.version}, route #{rv.route}, #{rv.phases.size} phases"
 
       rv.phases.each_with_index do |phase, idx|
@@ -159,10 +160,10 @@ module ReviewRun
                   prev_dir: rv.prev_dir, index: idx + 1, total: rv.phases.size)
     end
 
-    # resume: output present and last run of the phase did not fail
+    # resume: output present and last run of the phase was not cut short
     def skip_reason(phase, outdir_abs, usage)
       if phase.output && File.exist?(File.join(outdir_abs, phase.output)) &&
-         usage.last_status(phase.name) != 'failed'
+         !%w[failed limit].include?(usage.last_status(phase.name))
         return "#{phase.output} exists"
       end
 
@@ -177,10 +178,10 @@ module ReviewRun
 
     def run_phase(rv, phase, idx, usage)
       prompt = Prompt.render(manifest: rv.manifest, phase: phase, ctx: context(rv, idx))
-      log = File.join(@state_dir, 'logs', "#{rv.project}-#{rv.topic}", format('%02d-%s.jsonl', idx + 1, phase.name))
+      log = File.join(@state_dir, 'logs', "#{rv.window}-v#{rv.version}", format('%02d-%s.jsonl', idx + 1, phase.name))
       say "=== phase #{phase.name} (#{idx + 1} of #{rv.phases.size}), model #{phase.model}" \
           "#{", effort #{phase.effort}" if phase.effort}"
-      started, result, status, reason = run_past_limit(rv, phase, prompt, log)
+      started, result, status, reason = run_past_limit(rv, phase, prompt, log, usage)
       reason ||= phase_failure(rv, phase, result, status)
       log_usage(rv, phase, reason ? 'failed' : 'ok', result)
       if reason
@@ -213,32 +214,44 @@ module ReviewRun
     end
 
     # usage limit: pause, wait for the reset, re-run; reason set once retries run out
-    def run_past_limit(rv, phase, prompt, log)
+    def run_past_limit(rv, phase, prompt, log, usage = nil)
       hits = 0
       loop do
         started = @clock.call
-        result, status = run_claude(prompt, phase, log)
-        unless result&.limit_hit?
+        result, status, rate_limit = run_claude(prompt, phase, log)
+        unless limit_hit?(result, status, rate_limit)
           @pause.clear if hits.positive? && @pause.by == rv.window
           return [started, result, status, nil]
         end
 
         hits += 1
-        until_t = limit_until(result)
+        until_t = limit_until(result, rate_limit)
         @pause.set(until_t, by: rv.window)
         return [started, result, status, 'usage limit, retries exhausted'] if hits > LIMIT_RETRIES
 
         log_usage(rv, phase, 'limit', result)
+        if usage
+          usage.limit(phase: phase.name, model: phase.model, result: result, started_at: started)
+          usage.write
+        end
         say "usage limit in phase #{phase.name}, paused until #{until_t.strftime('%Y-%m-%d %H:%M:%S')} " \
             "(retry #{hits}/#{LIMIT_RETRIES})"
         @sleeper.call([(until_t - @clock.call).ceil, 0].max)
       end
     end
 
-    def limit_until(result)
+    # rejected rate_limit_event, unless the run still ended clean (e.g. carried by overage)
+    def limit_hit?(result, status, rate_limit)
+      return result&.limit_hit? || false unless rate_limit
+
+      clean = result && !result.is_error && status&.success?
+      !clean
+    end
+
+    def limit_until(result, rate_limit)
       now = @clock.call
       reset = begin
-        result.limit_reset(now)
+        rate_limit&.resets_at || (result ? result.limit_reset(now) : now + LIMIT_FALLBACK_WAIT)
       rescue StandardError
         now + LIMIT_FALLBACK_WAIT
       end
@@ -249,7 +262,7 @@ module ReviewRun
       @session.run(prompt, model: phase.model, effort: phase.effort, log: log)
     rescue SystemCallError => e
       say "ERROR: could not run #{@claude_bin}: #{e.message}"
-      [nil, nil]
+      [nil, nil, nil]
     end
 
     def finish(rv, usage)
@@ -260,9 +273,13 @@ module ReviewRun
       true
     end
 
+    # usage.json only when this run recorded a phase: a re-run of a finished review leaves none behind
     def save_usage(rv, usage)
+      meta = File.join(rv.outdir, 'metadata.json')
+      return commit([meta], "review(#{rv.topic}): update metadata") unless usage.changed?
+
       usage.write
-      commit(%w[usage.json metadata.json].map { |f| File.join(rv.outdir, f) }, "review(#{rv.topic}): add usage")
+      commit([File.join(rv.outdir, 'usage.json'), meta], "review(#{rv.topic}): add usage")
     end
 
     def run_findings_metadata(rv)
@@ -287,11 +304,17 @@ module ReviewRun
       paths = paths.select { |p| File.exist?(File.join(@workspace_dir, p)) }
       return true if paths.empty?
 
-      ok, out = git('status', '--porcelain', '--', *paths)
-      return false unless ok
-      return true if out.strip.empty?
+      return true if clean?(paths)
+      return true if git('add', '--', *paths).first && git('commit', '-q', '-m', msg, '--', *paths).first
+      return false unless clean?(paths)
 
-      git('add', '--', *paths).first && git('commit', '-q', '-m', msg, '--', *paths).first
+      say "#{paths.join(', ')} committed by another session"
+      true
+    end
+
+    def clean?(paths)
+      ok, out = git('status', '--porcelain', '--', *paths)
+      ok && out.strip.empty?
     end
 
     def git(*args)
