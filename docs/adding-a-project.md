@@ -225,6 +225,12 @@ To re-review only PRs you have already reviewed, add `only_reviewed: true` to th
 A changed or new PR is then enqueued only if `<name>/findings/<topic>/` exists; otherwise its head is recorded and skipped.
 Once you review such a PR by hand (`task enqueue`), its later pushes are polled like any other.
 
+A changed or new PR is not enqueued right away: the poller waits until its head has stayed the same for `debounce_minutes` (default 120), so a burst of pushes gets one review of the last one.
+A newer push restarts the wait.
+Set `debounce_minutes: 0` in the `poll` block to enqueue on the first cycle that sees the change.
+The wait applies to GitHub-PR projects only; hackorum topics are enqueued as before.
+While waiting, the poller logs `<name>: <topic> new commits <sha>, waiting for quiet (<n> min)` and keeps the pending head in `state/poll.state`.
+
 On first run the poller silently baselines: it records the current head shas for all open PRs and enqueues nothing.
 Only subsequent new commits or brand-new PRs are picked up from that point on.
 

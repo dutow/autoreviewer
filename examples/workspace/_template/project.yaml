@@ -36,3 +36,4 @@ review:
 # When enabled, bin/review-poll enqueues any open PR whose head commit changed.
 # poll:
 #   enabled: true
+#   debounce_minutes: 120   # wait for this many quiet minutes after a push; 0 = enqueue at once
