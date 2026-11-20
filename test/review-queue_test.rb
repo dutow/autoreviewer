@@ -67,3 +67,72 @@ class ReviewQueuePauseTest < Minitest::Test
     refute File.exist?(@path)
   end
 end
+
+class ReviewQueueLaunchTest < Minitest::Test
+  ENV_KEYS = %w[STATE_DIR WORKSPACE_DIR REVIEW_QUEUE_FILE REVIEW_QUEUE_PROCESSED].freeze
+
+  def setup
+    @saved_env = ENV_KEYS.to_h { |k| [k, ENV[k]] }
+    ENV_KEYS.each { |k| ENV.delete(k) }
+    @dir = Dir.mktmpdir
+    @ws = File.join(@dir, 'my ws')
+    @state = File.join(@dir, 'state')
+    ENV['STATE_DIR'] = @state
+    ENV['WORKSPACE_DIR'] = @ws
+    @queue = ReviewQueue.new
+    @base = File.expand_path('..', __dir__)
+    @calls = []
+    calls = @calls
+    @queue.define_singleton_method(:system) { |*a| calls << a; true }
+    @queue.define_singleton_method(:spawn_watcher) { |*| nil }
+  end
+
+  def teardown
+    FileUtils.rm_rf(@dir)
+    @saved_env.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
+  end
+
+  def project(yaml)
+    FileUtils.mkdir_p(File.join(@ws, 'p'))
+    File.write(File.join(@ws, 'p', 'project.yaml'), yaml)
+  end
+
+  def test_runner_cmd_topic
+    sig = File.join(@state, 'signals', 'a b.done')
+    cmd = @queue.send(:runner_cmd, 'p', 't1', sig)
+    assert_equal "cd #{Shellwords.escape(@ws)} && #{Shellwords.escape(File.join(@base, 'bin', 'review-run'))} " \
+                 "--done-file #{Shellwords.escape(sig)} p t1", cmd
+    refute_includes cmd, 'REVIEW_DONE_FILE'
+    refute_match(/ claude /, cmd)
+  end
+
+  def test_runner_cmd_commits
+    cmd = @queue.send(:runner_cmd, 'p', 'abc..def', '/s/x.done', commits: true)
+    assert_match(%r{review-run --done-file /s/x\.done --commits p abc\.\.def\z}, cmd)
+  end
+
+  def test_launch_uses_runner_with_phases
+    project("review:\n  command: rev\n  phases: [a]\n")
+    out, = capture_io { @queue.send(:launch_review, 'p', 'rev', 't1') }
+    cmd = @calls.first.last
+    assert_includes cmd, 'bin/review-run --done-file'
+    refute_match(/ claude /, cmd)
+    refute_match(/WARNING/, out)
+  end
+
+  def test_fallback_without_phases
+    project("review:\n  command: rev\n")
+    out, = capture_io { @queue.send(:launch_review, 'p', 'rev', 't1') }
+    sig = File.join(@state, 'signals', 'p-t1.done')
+    assert_equal "cd #{Shellwords.escape(@ws)} && REVIEW_DONE_FILE=#{Shellwords.escape(sig)} " \
+                 "claude --model opus --dangerously-skip-permissions -n p-t1 -- #{Shellwords.escape('/rev t1')}",
+                 @calls.first.last
+    assert_match(/WARNING.*review\.phases/, out)
+  end
+
+  def test_commits_always_runner
+    project("review:\n  command: rev\n")
+    capture_io { @queue.send(:launch_review, 'p', 'x', 'a..b', window_name: 'p-commits-a-b', commits: true) }
+    assert_includes @calls.first.last, '--commits p a..b'
+  end
+end

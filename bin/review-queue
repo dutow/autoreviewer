@@ -288,7 +288,7 @@ class ReviewQueue
 
     from, to = range.split('..')
     window = "#{project}-commits-#{from[0, 7]}-#{to.to_s[0, 7]}"
-    launch_review(project, command, range, window_name: window)
+    launch_review(project, command, range, window_name: window, commits: true)
   end
 
   def run_hook(cmd, cwd:)
@@ -316,17 +316,37 @@ class ReviewQueue
     ReviewRun::FindingsDir.prepare(base_dir: @base_dir, project_dir: project_dir, topic: topic)
   end
 
-  def launch_review(project, command, topic, window_name: "#{project}-#{topic}")
+  def runner_cmd(project, arg, signal, commits: false)
+    parts = [File.join(@base_dir, 'bin', 'review-run'), '--done-file', signal]
+    parts << '--commits' if commits
+    parts += [project, arg]
+    "cd #{Shellwords.escape(@workspace_dir)} && #{parts.map { |x| Shellwords.escape(x) }.join(' ')}"
+  end
+
+  def phases_configured?(project)
+    config, = load_project(project)
+    !config.dig('review', 'phases').nil?
+  rescue StandardError
+    false
+  end
+
+  def launch_review(project, command, topic, window_name: "#{project}-#{topic}", commits: false)
     signal = File.join(@state_dir, 'signals', "#{window_name}.done")
     FileUtils.mkdir_p(File.dirname(signal))
     FileUtils.rm_f(signal)
 
-    puts "[#{timestamp}] Launching Claude review in tmux window '#{window_name}'..."
-    claude_cmd = "REVIEW_DONE_FILE=#{Shellwords.escape(signal)} " \
-                 "claude --model opus --dangerously-skip-permissions -n #{Shellwords.escape(window_name)} " \
-                 "-- #{Shellwords.escape("/#{command} #{topic}")}"
-    system('tmux', 'new-window', '-n', window_name, '-d',
-           "cd #{Shellwords.escape(@workspace_dir)} && #{claude_cmd}")
+    if commits || phases_configured?(project)
+      puts "[#{timestamp}] Launching review-run in tmux window '#{window_name}'..."
+      shell_cmd = runner_cmd(project, topic, signal, commits: commits)
+    else
+      puts "[#{timestamp}] WARNING: #{project} has no review.phases; falling back to interactive claude"
+      puts "[#{timestamp}] Launching Claude review in tmux window '#{window_name}'..."
+      claude_cmd = "REVIEW_DONE_FILE=#{Shellwords.escape(signal)} " \
+                   "claude --model opus --dangerously-skip-permissions -n #{Shellwords.escape(window_name)} " \
+                   "-- #{Shellwords.escape("/#{command} #{topic}")}"
+      shell_cmd = "cd #{Shellwords.escape(@workspace_dir)} && #{claude_cmd}"
+    end
+    system('tmux', 'new-window', '-n', window_name, '-d', shell_cmd)
     spawn_watcher(signal, window_name)
     puts "[#{timestamp}] Review session started in window '#{window_name}' (auto-close armed)"
   end
