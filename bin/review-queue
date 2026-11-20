@@ -26,6 +26,7 @@ class ReviewQueue
     @running = true
     @pause = ReviewRun::Pause.new(File.join(@state_dir, 'paused'))
     @paused_until = nil
+    @launches = 0
   end
 
   def run
@@ -331,9 +332,8 @@ class ReviewQueue
   end
 
   def launch_review(project, command, topic, window_name: "#{project}-#{topic}", commits: false)
-    signal = File.join(@state_dir, 'signals', "#{window_name}.done")
+    signal = signal_path(window_name)
     FileUtils.mkdir_p(File.dirname(signal))
-    FileUtils.rm_f(signal)
 
     if commits || phases_configured?(project)
       puts "[#{timestamp}] Launching review-run in tmux window '#{window_name}'..."
@@ -342,29 +342,51 @@ class ReviewQueue
       puts "[#{timestamp}] WARNING: #{project} has no review.phases; falling back to interactive claude"
       puts "[#{timestamp}] Launching Claude review in tmux window '#{window_name}'..."
       claude_cmd = "REVIEW_DONE_FILE=#{Shellwords.escape(signal)} " \
-                   "claude --model opus --dangerously-skip-permissions -n #{Shellwords.escape(window_name)} " \
-                   "-- #{Shellwords.escape("/#{command} #{topic}")}"
+                   'claude --model opus --dangerously-skip-permissions --disallowedTools AskUserQuestion ' \
+                   "-n #{Shellwords.escape(window_name)} -- #{Shellwords.escape("/#{command} #{topic}")}"
       shell_cmd = "cd #{Shellwords.escape(@workspace_dir)} && #{claude_cmd}"
     end
-    system('tmux', 'new-window', '-n', window_name, '-d', shell_cmd)
-    spawn_watcher(signal, window_name)
-    puts "[#{timestamp}] Review session started in window '#{window_name}' (auto-close armed)"
+    window_id = tmux_new_window(window_name, shell_cmd)
+    unless window_id
+      puts "[#{timestamp}] WARNING: could not open tmux window '#{window_name}'"
+      return
+    end
+    spawn_watcher(signal, window_name, window_id)
+    puts "[#{timestamp}] Review session started in window '#{window_name}' (#{window_id}, auto-close armed)"
   end
 
-  def spawn_watcher(signal, window_name)
-    push_line = ENV['AUTO_PUSH'] == '1' ? "#{Shellwords.escape(File.join(@base_dir, 'bin', 'review-push'))} #{Shellwords.escape(window_name)}" : ": # AUTO_PUSH disabled"
-    script = <<~SH
-      while [ ! -e #{Shellwords.escape(signal)} ]; do sleep 2; done
-      #{push_line}
-      sleep #{GRACE_SECONDS}
-      # Re-check: a re-queued same-topic review rm -f's the sentinel on relaunch,
-      # so a stale watcher skips the kill instead of closing the new window.
-      [ -e #{Shellwords.escape(signal)} ] && tmux kill-window -t #{Shellwords.escape("reviews:#{window_name}")} 2>/dev/null
-    SH
-    pid = Process.spawn('bash', '-c', script, %i[out err] => File::NULL)
+  # one per launch: a watcher left from an older run of the same window name never sees it
+  def signal_path(window_name)
+    @launches += 1
+    File.join(@state_dir, 'signals', "#{window_name}-#{Time.now.to_i}-#{Process.pid}-#{@launches}.done")
+  end
+
+  # -> tmux window id (@N), nil on failure
+  def tmux_new_window(name, cmd)
+    out, st = Open3.capture2('tmux', 'new-window', '-P', '-F', '#{window_id}', '-n', name, '-d', cmd)
+    id = out.strip
+    st.success? && id.start_with?('@') ? id : nil
+  rescue SystemCallError
+    nil
+  end
+
+  def spawn_watcher(signal, window_name, window_id)
+    pid = Process.spawn('bash', '-c', watcher_script(signal, window_name, window_id), %i[out err] => File::NULL)
     Process.detach(pid)
   rescue => e
     puts "[#{timestamp}] WARNING: could not spawn auto-close watcher: #{e.message}"
+  end
+
+  # kills by window id: names repeat when a topic is re-queued
+  def watcher_script(signal, window_name, window_id)
+    push_line = ENV['AUTO_PUSH'] == '1' ? "#{Shellwords.escape(File.join(@base_dir, 'bin', 'review-push'))} #{Shellwords.escape(window_name)}" : ": # AUTO_PUSH disabled"
+    <<~SH
+      while [ ! -e #{Shellwords.escape(signal)} ]; do sleep 2; done
+      #{push_line}
+      sleep #{GRACE_SECONDS}
+      tmux kill-window -t #{Shellwords.escape(window_id)} 2>/dev/null
+      rm -f #{Shellwords.escape(signal)}
+    SH
   end
 
   def preflight

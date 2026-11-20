@@ -82,9 +82,11 @@ class ReviewQueueLaunchTest < Minitest::Test
     @queue = ReviewQueue.new
     @base = File.expand_path('..', __dir__)
     @calls = []
+    @watchers = []
     calls = @calls
-    @queue.define_singleton_method(:system) { |*a| calls << a; true }
-    @queue.define_singleton_method(:spawn_watcher) { |*| nil }
+    watchers = @watchers
+    @queue.define_singleton_method(:tmux_new_window) { |*a| calls << a; "@#{calls.size + 6}" }
+    @queue.define_singleton_method(:spawn_watcher) { |*a| watchers << a }
   end
 
   def teardown
@@ -123,10 +125,13 @@ class ReviewQueueLaunchTest < Minitest::Test
   def test_fallback_without_phases
     project("review:\n  command: rev\n")
     out, = capture_io { @queue.send(:launch_review, 'p', 'rev', 't1') }
-    sig = File.join(@state, 'signals', 'p-t1.done')
+    sig, name, id = @watchers.first
+    assert_equal ['p-t1', '@7'], [name, id]
     assert_equal "cd #{Shellwords.escape(@ws)} && REVIEW_DONE_FILE=#{Shellwords.escape(sig)} " \
-                 "claude --model opus --dangerously-skip-permissions -n p-t1 -- #{Shellwords.escape('/rev t1')}",
+                 'claude --model opus --dangerously-skip-permissions --disallowedTools AskUserQuestion ' \
+                 "-n p-t1 -- #{Shellwords.escape('/rev t1')}",
                  @calls.first.last
+    assert_equal 'p-t1', @calls.first.first
     assert_match(/WARNING.*review\.phases/, out)
   end
 
@@ -134,5 +139,74 @@ class ReviewQueueLaunchTest < Minitest::Test
     project("review:\n  command: rev\n")
     capture_io { @queue.send(:launch_review, 'p', 'x', 'a..b', window_name: 'p-commits-a-b', commits: true) }
     assert_includes @calls.first.last, '--commits p a..b'
+  end
+
+  def test_relaunch_same_topic_gets_own_signal_and_window_id
+    project("review:\n  command: rev\n  phases: [a]\n")
+    capture_io { 2.times { @queue.send(:launch_review, 'p', 'rev', 't1') } }
+    assert_equal %w[p-t1 p-t1], @calls.map(&:first)
+    (s1, n1, id1), (s2, n2, id2) = @watchers
+    assert_equal %w[p-t1 p-t1], [n1, n2]
+    assert_equal %w[@7 @8], [id1, id2]
+    refute_equal s1, s2
+    [s1, s2].each do |s|
+      assert_equal File.join(@state, 'signals'), File.dirname(s)
+      assert_match(/\Ap-t1-\d+-\d+-\d+\.done\z/, File.basename(s))
+    end
+    assert_includes @calls[0].last, "--done-file #{Shellwords.escape(s1)} "
+    assert_includes @calls[1].last, "--done-file #{Shellwords.escape(s2)} "
+  end
+
+  def test_no_watcher_when_window_fails
+    project("review:\n  command: rev\n  phases: [a]\n")
+    @queue.define_singleton_method(:tmux_new_window) { |*| nil }
+    out, = capture_io { @queue.send(:launch_review, 'p', 'rev', 't1') }
+    assert_empty @watchers
+    assert_match(/WARNING: could not open tmux window 'p-t1'/, out)
+  end
+
+  def fake_bin(dir)
+    FileUtils.mkdir_p(dir)
+    File.write(File.join(dir, 'tmux'), "#!/bin/sh\necho \"$*\" >> \"$FAKE_TMUX_LOG\"\necho '@42'\n")
+    File.write(File.join(dir, 'sleep'), "#!/bin/sh\nexit 0\n")
+    %w[tmux sleep].each { |f| File.chmod(0o755, File.join(dir, f)) }
+    dir
+  end
+
+  def with_fake_tmux
+    bin = fake_bin(File.join(@dir, 'bin'))
+    log = File.join(@dir, 'tmux.log')
+    saved = ENV.to_h.slice('PATH', 'FAKE_TMUX_LOG')
+    ENV['PATH'] = "#{bin}:#{ENV['PATH']}"
+    ENV['FAKE_TMUX_LOG'] = log
+    yield log
+  ensure
+    saved.each { |k, v| ENV[k] = v }
+    ENV.delete('FAKE_TMUX_LOG') unless saved.key?('FAKE_TMUX_LOG')
+  end
+
+  def test_tmux_new_window_returns_id
+    q = ReviewQueue.new
+    with_fake_tmux do |log|
+      assert_equal '@42', q.send(:tmux_new_window, 'p-t1', 'echo hi')
+      assert_equal "new-window -P -F \#{window_id} -n p-t1 -d echo hi\n", File.read(log)
+    end
+  end
+
+  def test_watcher_kills_window_by_id
+    q = ReviewQueue.new
+    sig = File.join(@state, 'signals', 'p-t1-1-2-3.done')
+    script = q.send(:watcher_script, sig, 'p-t1', '@42')
+    assert_includes script, 'tmux kill-window -t @42'
+    refute_includes script, 'reviews:'
+    refute_includes script, 'kill-window -t p-t1'
+    FileUtils.mkdir_p(File.dirname(sig))
+    FileUtils.touch(sig)
+    with_fake_tmux do |log|
+      _out, st = Open3.capture2e('bash', '-c', script)
+      assert st.success?
+      assert_equal "kill-window -t @42\n", File.read(log)
+    end
+    refute File.exist?(sig)
   end
 end
