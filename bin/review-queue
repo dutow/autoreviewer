@@ -6,6 +6,7 @@ require 'shellwords'
 require 'fileutils'
 require 'json'
 require 'yaml'
+require_relative '../lib/review_run/findings_dir'
 
 $stdout.sync = true
 
@@ -291,36 +292,7 @@ class ReviewQueue
   end
 
   def prepare_findings_dir(project_dir, topic)
-    meta_file = File.join(project_dir, 'review', topic, 'metadata.json')
-    unless File.exist?(meta_file)
-      puts "[#{timestamp}] WARNING: #{meta_file} not found; leaving findings dir to Claude"
-      return nil
-    end
-    version = JSON.parse(File.read(meta_file))['version']
-    if version.nil?
-      puts "[#{timestamp}] WARNING: version missing in metadata; leaving findings dir to Claude"
-      return nil
-    end
-
-    rel = File.join('findings', topic, "v#{version}")
-    abs = File.join(project_dir, rel)
-    FileUtils.mkdir_p(abs)
-
-    current = File.join(project_dir, 'current-reviews')
-    FileUtils.mkdir_p(current)
-    link = File.join(current, topic)
-    FileUtils.rm_f(link) if File.symlink?(link) || File.exist?(link)
-    File.symlink(File.join('..', rel), link)
-    puts "[#{timestamp}] Findings dir ready: #{rel}"
-
-    meta_cmd = [File.join(@base_dir, 'bin', 'findings-metadata'),
-                '--project', File.join(project_dir, 'project.yaml'), topic]
-    puts "[#{timestamp}] WARNING: findings-metadata failed (continuing)" unless system(*meta_cmd)
-
-    rel
-  rescue => e
-    puts "[#{timestamp}] WARNING: could not prepare findings dir: #{e.message}"
-    nil
+    ReviewRun::FindingsDir.prepare(base_dir: @base_dir, project_dir: project_dir, topic: topic)
   end
 
   def launch_review(project, command, topic, window_name: "#{project}-#{topic}")
