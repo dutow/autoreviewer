@@ -76,11 +76,13 @@ Must build `<topic>` using `<config>` (a file under `<name>/configs/`) into `<na
 
 The orchestrator runs each review in a tmux window and arms a watcher that closes the window ~120s after a sentinel file appears.
 The window runs `bin/review-run --done-file <sentinel> ...`, and the runner touches the sentinel when it ends, success or failure.
+Each launch gets its own sentinel path, and the watcher closes the window by its tmux id, so re-queueing a topic while an older run of it finishes is safe.
 A new review command or phase needs no completion step of its own.
 
 The workspace `Stop` hook in `workspace/.claude/settings.json` touches `$REVIEW_DONE_FILE` only when that variable is set.
 That is the case just for the interactive fallback (a project without `review.phases`).
 Phase sessions run without it, so one finished phase never closes the window.
+Phase sessions have `REVIEW_RUN=1` instead; a hook that should act in every review session, like the `PermissionRequest` auto-allow, checks `[ -n "$REVIEW_DONE_FILE$REVIEW_RUN" ]`.
 
 A usage-limit hit does not end the review: the runner waits for the reset and retries (see [setup.md](setup.md#usage-limit-pause)).
 

@@ -158,7 +158,11 @@ The queue starts each review as `bin/review-run --done-file <signal> <project> <
 Commit reviews run as `bin/review-run --done-file <signal> --commits <project> <from>..<to>`.
 The runner runs one headless `claude -p` session per phase of the project's route (see [adding-a-project.md](adding-a-project.md#review-phases)), with `--dangerously-skip-permissions` and `AskUserQuestion` disallowed.
 It touches the done file when it ends, success or failure, so the window closes the same way as before.
+The done file is new for every launch (`state/signals/<window>-<time>-<pid>-<n>.done`), and the auto-close watcher kills the tmux window by the id it got at creation, not by name.
+A watcher left over from an older run of the same topic therefore never closes a newer review's window.
 Phase sessions do not get `REVIEW_DONE_FILE`, so the workspace Stop hook does nothing in them.
+They get `REVIEW_RUN=1` instead, the marker workspace hooks use to tell a review session (`REVIEW_DONE_FILE` or `REVIEW_RUN` set) from an interactive one: the example `PermissionRequest` hook allows only when one of them is set.
+They also get `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, so a phase cannot leave background work behind.
 
 `CLAUDE_BIN` sets the claude binary the runner calls (default `claude`).
 `WORKSPACE_DIR` and `STATE_DIR` override the workspace and state paths, as for the queue.
@@ -168,15 +172,21 @@ A failed phase stops the review, prints `FAILED: <reason>`, and opens a tmux win
 
 ### Logs and usage
 
-- `state/logs/<window>/<NN>-<phase>.jsonl` - the raw stream-json output of each phase session, appended on every run.
-  `<window>` is `<project>-<topic>`, or `<project>-commits-<from>-<to>` for commit reviews (the file there is `commits.jsonl`).
+- `state/logs/<project>-<topic>-v<N>/<NN>-<phase>.jsonl` - the raw stream-json output of each phase session, appended on every run.
+  Commit reviews log to `state/logs/<project>-commits-<from>-<to>/commits.jsonl`.
+  `bin/review-prune` removes log dirs untouched for `REVIEW_PRUNE_DAYS` days (see [Pruning](#pruning-old-builds-and-worktrees)).
 - `state/usage.log` - one JSON line per finished or limit-interrupted phase: time, project, topic, version, route, phase, model, status (`ok`, `failed`, `limit`), cost and tokens.
 - `<project>/findings/<topic>/vNN/usage.json` - committed with the findings: route, claude version, per-phase tokens, cost and duration, and totals.
+  Runs cut short by the usage limit are in it too, with status `limit`, so the totals are the full cost of the review.
+  A re-run that runs no phase leaves `usage.json` as it is, and creates none.
   The webapp shows the cost on the review.
 
 ### Usage limit pause
 
 When a phase hits the claude usage limit, the runner writes `state/paused` (the reset time plus a two minute margin, and the window that set it), waits, and runs the phase again.
+A run counts as a limit hit when the stream had a `rate_limit_event` with status `rejected` and the run did not end cleanly, or when it ended with an error result reading `You've hit your ... limit`.
+The reset time is the event's `resetsAt`; without one it is parsed from the message (`resets 3pm`, `resets Nov 24, 3pm`, as local time), and when that fails too the runner waits an hour.
+It always waits at least five minutes.
 It gives up after 5 retries and fails the review.
 While `state/paused` is in the future the queue starts no new review; it prints `paused until ... (usage limit)` once and polls every 30 seconds.
 The runner removes the file after a successful retry.
@@ -186,8 +196,8 @@ To lift a pause by hand, delete `state/paused`.
 ### Resume
 
 Re-running a review for the same topic and version continues where it stopped.
-A phase is skipped when its output file already exists and its last run in `usage.json` did not fail; a skipped phase's output is still committed.
-A phase whose last run failed is run again, even if it left an output file.
+A phase is skipped when its output file already exists and its last run in `usage.json` did not fail or hit the usage limit; a skipped phase's output is still committed.
+A phase whose last run failed or hit the limit is run again, even if it left an output file.
 To redo a phase, delete its output file.
 
 ### Running by hand
@@ -214,6 +224,7 @@ Builds and review worktrees pile up: a postgres topic is a few GB, so a few mont
 A topic's age is the newest mtime across its build dir, its `status.yaml` files and its review worktree, so a re-review restarts the clock.
 It never touches `builds/master`, builds named after a `branches/` checkout (the stable-branch installs other projects build against), or a topic whose review tmux window is still open.
 Findings are untouched: they live in `findings/` and are committed.
+It also removes runner log dirs under `state/logs/` whose newest file is older than the same cutoff; it finds the state dir like the queue does (`STATE_DIR`, default `state/`).
 
 The queue runs it at startup and before each build, so the space is freed before the next build needs it.
 Run it by hand, or preview what would go:
@@ -244,7 +255,7 @@ That's your backup; the volumes are convenience state, not sources of truth.
 ## Debugging
 
 - `task attach` - attach to the `reviews` tmux session (Ctrl-b d to detach).
-- `state/logs/<window>/` - raw per-phase logs of the runner; `state/usage.log` - cost per phase.
+- `state/logs/<project>-<topic>-v<N>/` - raw per-phase logs of the runner; `state/usage.log` - cost per phase.
 - `task shell PROJ=<name>` - shell in the container, in `workspace/<name>` (omit `PROJ` for `workspace/` itself).
 - `task logs` - tail queue + webapp container logs.
 - `task doctor` - run the same preflight checks the queue runs at startup (`.env` present, `workspace/` present, `bin/review-queue --check`).
