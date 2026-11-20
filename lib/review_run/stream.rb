@@ -1,0 +1,119 @@
+require 'json'
+
+module ReviewRun
+  module Stream
+    SUB_PREFIX = '  [sub] '.freeze
+
+    def self.parse_line(line)
+      s = line.to_s.strip
+      return nil if s.empty?
+      ev = JSON.parse(s)
+      ev.is_a?(Hash) ? ev : nil
+    rescue JSON::ParserError
+      nil
+    end
+
+    def self.format_event(event)
+      out = format_body(event)
+      return nil if out.nil? || out.empty?
+      event['parent_tool_use_id'] ? out.lines.map { |l| SUB_PREFIX + l }.join : out
+    end
+
+    def self.format_body(event)
+      case event['type']
+      when 'system'
+        return nil unless event['subtype'] == 'init'
+        "== session #{event['session_id']} (#{event['model']})"
+      when 'assistant'
+        blocks(event).filter_map do |b|
+          case b['type']
+          when 'text' then b['text'].to_s[0, 2000]
+          when 'tool_use' then tool_line(b)
+          end
+        end.join("\n")
+      when 'user'
+        blocks(event).filter_map do |b|
+          next unless b['type'] == 'tool_result' && b['is_error'] == true
+          "!! #{content_text(b['content']).lines.first.to_s.chomp}"
+        end.join("\n")
+      when 'result'
+        format('== result: %s, %d turns, $%.2f, %.1fs', event['subtype'],
+               event['num_turns'].to_i, event['total_cost_usd'].to_f,
+               event['duration_ms'].to_f / 1000)
+      end
+    end
+
+    def self.blocks(event)
+      c = event.dig('message', 'content')
+      c.is_a?(Array) ? c.select { |b| b.is_a?(Hash) } : []
+    end
+
+    def self.content_text(c)
+      return c.to_s unless c.is_a?(Array)
+      c.map { |x| x.is_a?(Hash) ? x['text'].to_s : x.to_s }.join("\n")
+    end
+
+    def self.tool_line(block)
+      input = block['input'] || {}
+      arg =
+        case block['name']
+        when 'Bash' then input['command'].to_s[0, 120]
+        when 'Read', 'Edit', 'Write' then input['file_path']
+        when 'Agent', 'Task' then input['description']
+        when 'Grep', 'Glob' then input['pattern']
+        end
+      "-> #{block['name']}: #{arg}"
+    end
+  end
+
+  class Result
+    LIMIT_RE = /usage limit|limit reached|hit your limit/i
+    TOKEN_KEYS = %w[input output cache_read cache_write].freeze
+    USAGE_FIELDS = {
+      'input' => 'inputTokens',
+      'output' => 'outputTokens',
+      'cache_read' => 'cacheReadInputTokens',
+      'cache_write' => 'cacheCreationInputTokens',
+      'cost_usd' => 'costUSD'
+    }.freeze
+
+    attr_reader :is_error, :subtype, :text, :cost_usd, :duration_ms,
+                :num_turns, :session_id, :models, :tokens
+
+    def self.from_event(event)
+      new(event)
+    end
+
+    def initialize(event)
+      @is_error = event['is_error'] == true
+      @subtype = event['subtype']
+      @text = event['result'].to_s
+      @cost_usd = event['total_cost_usd'].to_f
+      @duration_ms = event['duration_ms'].to_i
+      @num_turns = event['num_turns'].to_i
+      @session_id = event['session_id']
+      @models = (event['modelUsage'] || {}).to_h do |name, u|
+        [name, USAGE_FIELDS.transform_values { |f| u[f] || 0 }]
+      end
+      @tokens = TOKEN_KEYS.to_h { |k| [k, @models.values.sum { |m| m[k] }] }
+    end
+
+    def limit_hit?
+      is_error && text.match?(LIMIT_RE)
+    end
+
+    def limit_reset(now)
+      if (m = text.match(/\|(\d{10})/))
+        Time.at(m[1].to_i)
+      elsif (m = text.match(/resets (?:at )?(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i))
+        hour = m[1].to_i % 12
+        hour += 12 if m[3].downcase == 'pm'
+        t = Time.local(now.year, now.month, now.day, hour, m[2].to_i)
+        t += 86400 if t <= now
+        t
+      else
+        now + 3600
+      end
+    end
+  end
+end
