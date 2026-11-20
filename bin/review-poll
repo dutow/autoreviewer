@@ -82,11 +82,26 @@ class ReviewPoll
         only_reviewed: cfg.dig('poll', 'only_reviewed') == true,
         hackorum:    cfg.dig('poll', 'hackorum') == true,
         commit_review: cfg['commit_review'],
+        debounce_minutes: [(cfg.dig('poll', 'debounce_minutes') || DEBOUNCE_MINUTES_DEFAULT).to_i, 0].max,
       }
     rescue StandardError => e
       warn "review-poll: skipping #{yaml}: #{e.message}"
       nil
     end
+  end
+
+  DEBOUNCE_MINUTES_DEFAULT = 120
+
+  # Pure. pending: {topic => {"head", "seen_at"}}. Returns [enqueue_now?, new pending].
+  def debounce_ready?(pending, topic, head, now, minutes)
+    rest = pending.reject { |t, _| t == topic }
+    return [true, rest] if minutes <= 0
+
+    entry = pending[topic]
+    return [false, rest.merge(topic => { 'head' => head, 'seen_at' => now.getutc.iso8601 })] unless entry && entry['head'] == head
+
+    quiet = now - Time.iso8601(entry['seen_at']) >= minutes * 60
+    quiet ? [true, rest] : [false, pending]
   end
 
   # Pure classifier. prev: nil (project not yet baselined) or Hash{topic => sha}.
@@ -493,6 +508,8 @@ class ReviewPoll
         log "#{proj[:name]}: baseline recorded (#{prs.size} open PRs)"
       else
         new_state = {}
+        open_topics = prs.map { |pr| pr[:topic] }
+        pending = (prev['debounce'].is_a?(Hash) ? prev['debounce'] : {}).select { |t, _| open_topics.include?(t) }
         result[:decisions].each do |d|
           case d[:status]
           when :unchanged
@@ -504,14 +521,25 @@ class ReviewPoll
               # hand, its later pushes are polled like any other.
               new_state[d[:topic]] = d[:head]
               log "#{proj[:name]}: #{d[:topic]} #{kind} #{d[:head][0, 7]}, not reviewed yet, skipped (only_reviewed)"
+              next
+            end
+            minutes = proj[:debounce_minutes].to_i
+            ready, pending = debounce_ready?(pending, d[:topic], d[:head], now, minutes)
+            if !ready
+              new_state[d[:topic]] = prev[d[:topic]] if prev.key?(d[:topic])
+              log "#{proj[:name]}: #{d[:topic]} #{kind} #{d[:head][0, 7]}, waiting for quiet (#{minutes} min)"
             elsif enqueue.call(proj[:name], d[:topic])
               new_state[d[:topic]] = d[:head]
               log "#{proj[:name]}: #{d[:topic]} #{kind} #{d[:head][0, 7]}, enqueued"
             else
+              # keep the quiet period satisfied so the next cycle retries at once
+              pending = pending.merge(d[:topic] => { 'head' => d[:head], 'seen_at' => (now - minutes * 60).getutc.iso8601 }) if minutes.positive?
+              new_state[d[:topic]] = prev[d[:topic]] if prev.key?(d[:topic])
               log "#{proj[:name]}: #{d[:topic]} enqueue failed, will retry next cycle"
             end
           end
         end
+        new_state['debounce'] = pending unless pending.empty?
         new_state['commit_review'] = cr if cr
         new_state['hackorum'] = hk_keep if hk_keep
         @state[proj[:name]] = new_state

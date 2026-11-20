@@ -265,6 +265,198 @@ class ReviewPollRunOnceTest < Minitest::Test
   end
 end
 
+class ReviewPollDebounceTest < Minitest::Test
+  T0 = Time.utc(2026, 11, 20, 10, 0, 0)
+  PROJ_D = [{ name: 'psp', source: 'o/psp', prefix: 'pr', base_branch: 'main',
+              master_dir: '/tmp/psp/master', debounce_minutes: 120 }].freeze
+
+  def with_poller
+    Dir.mktmpdir do |dir|
+      ENV['REVIEW_POLL_STATE'] = File.join(dir, '.review-poll.state')
+      ENV['WORKSPACE_DIR'] = dir
+      yield ReviewPoll.new(base_dir: dir)
+    ensure
+      ENV.delete('REVIEW_POLL_STATE')
+      ENV.delete('WORKSPACE_DIR')
+    end
+  end
+
+  def cycle(poller, prs, at, calls, projects: PROJ_D, fail: [])
+    poller.run_once(projects: projects,
+                    fetch: ->(_s) { prs },
+                    enqueue: ->(p, t) { calls << [p, t]; !fail.include?(t) },
+                    refresh: ->(_p, _b) {},
+                    now: at)
+  end
+
+  def mins(n) = T0 + n * 60
+
+  def test_debounce_ready_zero_minutes_is_ready_and_drops_entry
+    with_poller do |p|
+      ready, pending = p.debounce_ready?({ 'pr1' => { 'head' => 'a', 'seen_at' => T0.iso8601 } }, 'pr1', 'b', T0, 0)
+      assert ready
+      assert_equal({}, pending)
+    end
+  end
+
+  def test_debounce_ready_new_or_changed_head_starts_wait
+    with_poller do |p|
+      ready, pending = p.debounce_ready?({}, 'pr1', 'a', T0, 120)
+      refute ready
+      assert_equal({ 'pr1' => { 'head' => 'a', 'seen_at' => T0.iso8601 } }, pending)
+      ready, pending = p.debounce_ready?(pending, 'pr1', 'b', mins(30), 120)
+      refute ready
+      assert_equal({ 'pr1' => { 'head' => 'b', 'seen_at' => mins(30).iso8601 } }, pending)
+    end
+  end
+
+  def test_debounce_ready_same_head_after_quiet_period
+    with_poller do |p|
+      start = { 'pr1' => { 'head' => 'a', 'seen_at' => T0.iso8601 } }
+      ready, pending = p.debounce_ready?(start, 'pr1', 'a', mins(120), 120)
+      assert ready
+      assert_equal({}, pending)
+    end
+  end
+
+  def test_debounce_ready_same_head_still_waiting
+    with_poller do |p|
+      start = { 'pr1' => { 'head' => 'a', 'seen_at' => T0.iso8601 } }
+      ready, pending = p.debounce_ready?(start, 'pr1', 'a', mins(119), 120)
+      refute ready
+      assert_equal(start, pending)
+    end
+  end
+
+  def test_debounce_waits_before_enqueue
+    with_poller do |poller|
+      poller.state['psp'] = { 'pr1' => 'aaa' }
+      calls = []
+      prs = [{ number: 1, head: 'bbb' }]
+      cycle(poller, prs, T0, calls)
+      assert_empty calls
+      assert_equal 'aaa', poller.state['psp']['pr1']
+      assert_equal({ 'pr1' => { 'head' => 'bbb', 'seen_at' => T0.iso8601 } }, poller.state['psp']['debounce'])
+      cycle(poller, prs, mins(119), calls)
+      assert_empty calls
+      cycle(poller, prs, mins(120), calls)
+      assert_equal [['psp', 'pr1']], calls
+      assert_equal({ 'pr1' => 'bbb' }, poller.state['psp'])
+    end
+  end
+
+  def test_debounce_newer_push_restarts_wait
+    with_poller do |poller|
+      poller.state['psp'] = { 'pr1' => 'aaa' }
+      calls = []
+      cycle(poller, [{ number: 1, head: 'AAA' }], T0, calls)
+      cycle(poller, [{ number: 1, head: 'BBB' }], mins(60), calls)
+      cycle(poller, [{ number: 1, head: 'BBB' }], mins(120), calls)
+      assert_empty calls
+      cycle(poller, [{ number: 1, head: 'BBB' }], mins(180), calls)
+      assert_equal [['psp', 'pr1']], calls
+      assert_equal 'BBB', poller.state['psp']['pr1']
+    end
+  end
+
+  def test_debounce_zero_enqueues_immediately
+    with_poller do |poller|
+      poller.state['psp'] = { 'pr1' => 'aaa' }
+      calls = []
+      cycle(poller, [{ number: 1, head: 'bbb' }], T0, calls,
+            projects: [PROJ_D.first.merge(debounce_minutes: 0)])
+      assert_equal [['psp', 'pr1']], calls
+      assert_equal({ 'pr1' => 'bbb' }, poller.state['psp'])
+    end
+  end
+
+  def test_debounce_new_pr_waits_too
+    with_poller do |poller|
+      poller.state['psp'] = { 'pr1' => 'aaa' }
+      calls = []
+      prs = [{ number: 1, head: 'aaa' }, { number: 2, head: 'ccc' }]
+      cycle(poller, prs, T0, calls)
+      assert_empty calls
+      refute poller.state['psp'].key?('pr2')
+      cycle(poller, prs, mins(120), calls)
+      assert_equal [['psp', 'pr2']], calls
+    end
+  end
+
+  def test_debounce_closed_pr_dropped
+    with_poller do |poller|
+      poller.state['psp'] = { 'pr1' => 'aaa', 'pr2' => 'bbb' }
+      calls = []
+      cycle(poller, [{ number: 1, head: 'aaa' }, { number: 2, head: 'BBB' }], T0, calls)
+      assert poller.state['psp']['debounce'].key?('pr2')
+      cycle(poller, [{ number: 1, head: 'aaa' }], mins(120), calls)
+      assert_empty calls
+      assert_equal({ 'pr1' => 'aaa' }, poller.state['psp'])
+    end
+  end
+
+  def test_debounce_old_state_without_key
+    with_poller do |poller|
+      poller.state['psp'] = { 'pr1' => 'aaa', 'hackorum' => { 'cursor' => 'x' } }
+      calls = []
+      cycle(poller, [{ number: 1, head: 'bbb' }], T0, calls)
+      assert_empty calls
+      assert_equal 'bbb', poller.state['psp']['debounce']['pr1']['head']
+      assert_equal({ 'cursor' => 'x' }, poller.state['psp']['hackorum'])
+    end
+  end
+
+  def test_debounce_only_reviewed_unreviewed_skips_without_wait
+    with_poller do |poller|
+      dir = poller.base_dir
+      proj = [PROJ_D.first.merge(findings_dir: File.join(dir, 'psp', 'findings'), only_reviewed: true)]
+      poller.state['psp'] = { 'pr1' => 'aaa' }
+      calls = []
+      cycle(poller, [{ number: 1, head: 'bbb' }], T0, calls, projects: proj)
+      assert_empty calls
+      assert_equal({ 'pr1' => 'bbb' }, poller.state['psp'])
+    end
+  end
+
+  def test_debounce_enqueue_failure_retries
+    with_poller do |poller|
+      poller.state['psp'] = { 'pr1' => 'aaa' }
+      calls = []
+      prs = [{ number: 1, head: 'bbb' }]
+      cycle(poller, prs, T0, calls)
+      cycle(poller, prs, mins(120), calls, fail: ['pr1'])
+      assert_equal [['psp', 'pr1']], calls
+      assert_equal 'aaa', poller.state['psp']['pr1']
+      assert poller.state['psp']['debounce'].key?('pr1')
+      cycle(poller, prs, mins(123), calls)
+      assert_equal [['psp', 'pr1'], ['psp', 'pr1']], calls
+      assert_equal({ 'pr1' => 'bbb' }, poller.state['psp'])
+    end
+  end
+
+  def test_debounce_baseline_creates_no_entries
+    with_poller do |poller|
+      calls = []
+      cycle(poller, [{ number: 1, head: 'aaa' }], T0, calls)
+      assert_empty calls
+      assert_equal({ 'pr1' => 'aaa' }, poller.state['psp'])
+    end
+  end
+
+  def test_enabled_projects_debounce_minutes
+    with_poller do |poller|
+      dir = poller.base_dir
+      { 'a' => '', 'b' => "  debounce_minutes: 0\n", 'c' => "  debounce_minutes: -5\n", 'd' => "  debounce_minutes: 30\n" }.each do |name, extra|
+        FileUtils.mkdir_p(File.join(dir, name))
+        File.write(File.join(dir, name, 'project.yaml'),
+                   "name: #{name}\nbase_branch: main\nsource: o/#{name}\npoll:\n  enabled: true\n#{extra}")
+      end
+      got = poller.send(:enabled_projects).to_h { |p| [p[:name], p[:debounce_minutes]] }
+      assert_equal({ 'a' => 120, 'b' => 0, 'c' => 0, 'd' => 30 }, got)
+    end
+  end
+end
+
 class ReviewPollRefreshTest < Minitest::Test
   def sh(dir, *args)
     system('git', '-C', dir, *args, out: File::NULL, err: File::NULL) or
