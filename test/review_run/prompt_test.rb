@@ -39,6 +39,16 @@ class PromptTest < Minitest::Test
     end
   end
 
+  def test_run_line_depends_on_phase_count
+    with_setup do |m, ph|
+      out = ReviewRun::Prompt.render(manifest: m, phase: ph, ctx: ctx)
+      assert_includes out, "\nRun only this phase, without stopping for user input.\n"
+      single = ReviewRun::Prompt.render(manifest: m, phase: ph, ctx: ctx(index: 1, total: 1))
+      assert_includes single, "\nRun without stopping for user input.\n"
+      refute_includes single, 'only this phase'
+    end
+  end
+
   def test_prev_dir_shown
     with_setup do |m, ph|
       out = ReviewRun::Prompt.render(manifest: m, phase: ph, ctx: ctx(prev_dir: 'postgres/findings/t1/v2'))

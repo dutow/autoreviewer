@@ -33,7 +33,7 @@ module ReviewRun
         Review worktree: #{ctx.project}/review/#{ctx.topic}
         Previous reviewed version: #{ctx.prev_dir || 'none'}
 
-        Run only this phase, without stopping for user input.
+        #{ctx.total == 1 ? 'Run' : 'Run only this phase,'} without stopping for user input.
         Do not start background agents or background tasks; wait for every subagent to finish before you end.
         All paths are relative to the workspace root (the current directory).
       H
