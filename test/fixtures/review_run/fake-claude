@@ -3,7 +3,9 @@
 
 # Test double for `claude -p --output-format stream-json`.
 # Plan (FAKE_CLAUDE_PLAN, JSON): {"<phase>": {"write": [..], "commit": true, "exit": 0,
-#   "no_result": false, "limit_first": false, "limit_text": "...", "noise": false, "text": "..."}}
+#   "no_result": false, "limit_first": false, "limit_times": 0, "limit_text": "...", "noise": false,
+#   "text": "..."}}
+# limit_first / limit_times: the first 1 / N calls for the phase hit the usage limit.
 
 require 'json'
 require 'fileutils'
@@ -38,8 +40,8 @@ $stdout.sync = true
 puts JSON.generate('type' => 'system', 'subtype' => 'init', 'session_id' => session, 'model' => 'fake-model')
 warn 'fake-claude: stderr noise' if step['noise']
 
-limited = step['limit_first'] && prior.none? { |c| c['phase'] == phase }
-if limited
+limit_times = step['limit_times'] || (step['limit_first'] ? 1 : 0)
+if prior.count { |c| c['phase'] == phase } < limit_times
   puts JSON.generate('type' => 'result', 'subtype' => 'success', 'is_error' => true,
                      'result' => step['limit_text'] || 'Claude AI usage limit reached|1800000000',
                      'session_id' => session, 'num_turns' => 1, 'duration_ms' => 10, 'total_cost_usd' => 0)

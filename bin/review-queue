@@ -7,11 +7,13 @@ require 'fileutils'
 require 'json'
 require 'yaml'
 require_relative '../lib/review_run/findings_dir'
+require_relative '../lib/review_run/pause'
 
 $stdout.sync = true
 
 class ReviewQueue
   GRACE_SECONDS = 120
+  PAUSE_POLL_SECONDS = 30
 
   def initialize
     @base_dir = File.expand_path('..', __dir__)
@@ -22,6 +24,8 @@ class ReviewQueue
     @projects_dir = @workspace_dir
     @dry_run = !ENV['REVIEW_QUEUE_DRYRUN'].to_s.empty?
     @running = true
+    @pause = ReviewRun::Pause.new(File.join(@state_dir, 'paused'))
+    @paused_until = nil
   end
 
   def run
@@ -40,6 +44,11 @@ class ReviewQueue
     prune_old
 
     while @running
+      if paused_now?
+        sleep PAUSE_POLL_SECONDS
+        next
+      end
+
       topic_id = next_topic
       if topic_id
         begin
@@ -52,6 +61,18 @@ class ReviewQueue
         sleep 3
       end
     end
+  end
+
+  # usage-limit pause set by a runner; prints once per pause
+  def paused_now?(now = Time.now)
+    t = @pause.active?(now) && @pause.until_time
+    unless t
+      @paused_until = nil
+      return false
+    end
+    puts "[#{timestamp}] paused until #{t.strftime('%Y-%m-%d %H:%M:%S')} (usage limit)" unless t == @paused_until
+    @paused_until = t
+    true
   end
 
   private

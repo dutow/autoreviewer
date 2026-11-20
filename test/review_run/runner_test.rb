@@ -91,10 +91,10 @@ class RunnerTest < Minitest::Test
     out
   end
 
-  def runner(sleeper: ->(s) { @slept << s })
+  def runner(sleeper: ->(s) { @slept << s }, clock: -> { Time.now })
     @out = StringIO.new
     ReviewRun::Runner.new(base_dir: @base, workspace_dir: @ws, state_dir: @state,
-                          claude_bin: FAKE, out: @out, sleeper: sleeper)
+                          claude_bin: FAKE, out: @out, sleeper: sleeper, clock: clock)
   end
 
   def run_topic(**kw)
@@ -287,6 +287,67 @@ class RunnerTest < Minitest::Test
     assert_equal %w[a a b c], calls.map { |c| c['phase'] }
     assert_equal '', dirty("#{OUT_REL}/a.md")
     assert_equal '', dirty('p/findings')
+  end
+
+  LIMIT_EPOCH = 1_800_000_000
+  LIMIT_TEXT = "Claude AI usage limit reached|#{LIMIT_EPOCH}".freeze
+  NOW = Time.at(LIMIT_EPOCH - 1000)
+
+  def pause_file
+    File.join(@state, 'paused')
+  end
+
+  def limit_plan(step)
+    plan(default_plan.merge('b' => { 'write' => ['b.md'], 'limit_text' => LIMIT_TEXT }.merge(step)))
+  end
+
+  def test_limit_hit_pauses_and_retries
+    limit_plan('limit_first' => true)
+    seen = []
+    ok = run_topic(clock: -> { NOW }, sleeper: lambda { |s|
+      @slept << s
+      seen << JSON.parse(File.read(pause_file))
+    })
+    assert ok, output
+    assert_equal %w[a b b c], calls.map { |c| c['phase'] }
+    assert_equal [1120], @slept
+    assert_equal [{ 'until' => Time.at(LIMIT_EPOCH + 120).iso8601, 'by' => 'p-t1' }], seen
+    refute File.exist?(pause_file)
+    assert_equal %w[a b c], usage['phases'].map { |p| p['phase'] }
+    assert_equal %w[ok ok ok], usage['phases'].map { |p| p['status'] }
+    assert_equal %w[ok limit ok ok], usage_log.map { |l| l['status'] }
+    assert_match(%r{usage limit in phase b, paused until .* \(retry 1/5\)}, output)
+  end
+
+  def test_limit_retries_exhausted_fails_phase
+    limit_plan('limit_times' => 6)
+    refute run_topic(clock: -> { NOW })
+    assert_equal %w[a b b b b b b], calls.map { |c| c['phase'] }
+    assert_equal [1120] * 5, @slept
+    a, b, *rest = usage['phases']
+    assert_empty rest
+    assert_equal 'ok', a['status']
+    assert_equal ['failed', 'usage limit, retries exhausted'], b.values_at('status', 'reason')
+    assert_equal %w[ok limit limit limit limit limit failed], usage_log.map { |l| l['status'] }
+    assert_equal Time.at(LIMIT_EPOCH + 120).iso8601, JSON.parse(File.read(pause_file))['until']
+    assert_includes output, 'FAILED: phase b: usage limit, retries exhausted'
+    refute File.exist?(outdir('c.md'))
+  end
+
+  def test_limit_reset_unparsable_waits_an_hour
+    limit_plan('limit_first' => true, 'limit_text' => 'Claude AI usage limit reached, resets 3:75pm')
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [3600 + 120], @slept
+    assert_equal %w[a b b c], calls.map { |c| c['phase'] }
+  end
+
+  def test_error_without_limit_text_fails_without_pause
+    limit_plan('limit_first' => true, 'limit_text' => 'API Error: 500')
+    refute run_topic
+    assert_equal %w[a b], calls.map { |c| c['phase'] }
+    assert_empty @slept
+    refute File.exist?(pause_file)
+    assert_match(/claude error/, usage['phases'].last['reason'])
   end
 
   def test_warns_on_api_key

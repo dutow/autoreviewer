@@ -1,15 +1,15 @@
 require 'open3'
 require 'json'
 require 'yaml'
-require 'fileutils'
 require 'shellwords'
 require 'time'
 
 require_relative 'manifest'
 require_relative 'prompt'
-require_relative 'stream'
 require_relative 'usage'
 require_relative 'findings_dir'
+require_relative 'session'
+require_relative 'pause'
 
 module ReviewRun
   class RunError < StandardError; end
@@ -17,7 +17,10 @@ module ReviewRun
   class Runner
     GIT_RETRIES = 5
     GIT_RETRY_WAIT = 2
-    CHILD_ENV = { 'REVIEW_DONE_FILE' => nil }.freeze
+    LIMIT_RETRIES = 5
+    LIMIT_GRACE = 120
+    LIMIT_FALLBACK_WAIT = 3600
+    CHILD_ENV = Session::CHILD_ENV
     API_KEY_WARNING = 'WARNING: ANTHROPIC_API_KEY is set; claude -p will bill the API key'.freeze
 
     Review = Struct.new(:project, :topic, :version, :route, :yaml, :manifest, :phases,
@@ -32,6 +35,8 @@ module ReviewRun
       @out = out
       @sleeper = sleeper
       @clock = clock
+      @session = Session.new(claude_bin: claude_bin, workspace_dir: workspace_dir, out: out)
+      @pause = Pause.new(File.join(state_dir, 'paused'))
     end
 
     def run_topic(project:, topic:, route: nil)
@@ -42,7 +47,7 @@ module ReviewRun
 
       rv.outdir = File.join(project, rel)
       outdir_abs = File.join(@workspace_dir, rv.outdir)
-      usage = Usage.new(path: File.join(outdir_abs, 'usage.json'), route: rv.route, claude_version: claude_version)
+      usage = Usage.new(path: File.join(outdir_abs, 'usage.json'), route: rv.route, claude_version: @session.version)
       say "=== review #{project}/#{topic} v#{rv.version}, route #{rv.route}, #{rv.phases.size} phases"
 
       rv.phases.each_with_index do |phase, idx|
@@ -126,11 +131,9 @@ module ReviewRun
       log = File.join(@state_dir, 'logs', "#{rv.project}-#{rv.topic}", format('%02d-%s.jsonl', idx + 1, phase.name))
       say "=== phase #{phase.name} (#{idx + 1} of #{rv.phases.size}), model #{phase.model}" \
           "#{", effort #{phase.effort}" if phase.effort}"
-      started = @clock.call
-      result, status = run_claude(prompt, model: phase.model, effort: phase.effort, log: log)
-      reason = phase_failure(rv, phase, result, status)
-      log_usage(project: rv.project, topic: rv.topic, version: rv.version, route: rv.route,
-                phase: phase.name, model: phase.model, status: reason ? 'failed' : 'ok', result: result)
+      started, result, status, reason = run_past_limit(rv, phase, prompt, log)
+      reason ||= phase_failure(rv, phase, result, status)
+      log_usage(rv, phase, reason ? 'failed' : 'ok', result)
       if reason
         usage.fail(phase: phase.name, reason: reason, result: result, started_at: started)
         save_usage(rv, usage)
@@ -160,53 +163,44 @@ module ReviewRun
       status.exited? ? "exit #{status.exitstatus}" : status.to_s
     end
 
-    def run_claude(prompt, model:, effort:, log:)
-      cmd = [@claude_bin, '-p']
-      cmd += ['--model', model] if model
-      cmd += ['--effort', effort] if effort
-      cmd += %w[--dangerously-skip-permissions --disallowedTools AskUserQuestion
-                --output-format stream-json --verbose]
-      FileUtils.mkdir_p(File.dirname(log))
-      result_ev = nil
-      status = nil
-      File.open(log, 'a') do |lf|
-        Open3.popen2e(CHILD_ENV, *cmd, chdir: @workspace_dir, unsetenv_others: false) do |stdin, io, wait|
-          begin
-            stdin.write(prompt)
-          rescue Errno::EPIPE
-            nil
-          end
-          stdin.close
-          io.set_encoding(Encoding::UTF_8)
-          io.each_line do |line|
-            lf.write(line)
-            lf.flush
-            ev = show(line)
-            result_ev = ev if ev && ev['type'] == 'result'
-          end
-          status = wait.value
+    # usage limit: pause, wait for the reset, re-run; reason set once retries run out
+    def run_past_limit(rv, phase, prompt, log)
+      hits = 0
+      loop do
+        started = @clock.call
+        result, status = run_claude(prompt, phase, log)
+        unless result&.limit_hit?
+          @pause.clear if hits.positive?
+          return [started, result, status, nil]
         end
+
+        hits += 1
+        until_t = limit_until(result)
+        @pause.set(until_t, by: "#{rv.project}-#{rv.topic}")
+        return [started, result, status, 'usage limit, retries exhausted'] if hits > LIMIT_RETRIES
+
+        log_usage(rv, phase, 'limit', result)
+        say "usage limit in phase #{phase.name}, paused until #{until_t.strftime('%Y-%m-%d %H:%M:%S')} " \
+            "(retry #{hits}/#{LIMIT_RETRIES})"
+        @sleeper.call([(until_t - @clock.call).ceil, 0].max)
       end
-      [to_result(result_ev), status]
+    end
+
+    def limit_until(result)
+      now = @clock.call
+      reset = begin
+        result.limit_reset(now)
+      rescue StandardError
+        now + LIMIT_FALLBACK_WAIT
+      end
+      reset + LIMIT_GRACE
+    end
+
+    def run_claude(prompt, phase, log)
+      @session.run(prompt, model: phase.model, effort: phase.effort, log: log)
     rescue SystemCallError => e
       say "ERROR: could not run #{@claude_bin}: #{e.message}"
       [nil, nil]
-    end
-
-    def show(line)
-      ev = Stream.parse_line(line)
-      text = ev ? Stream.format_event(ev) : line.chomp
-      @out.puts(text) unless text.nil? || text.strip.empty?
-      ev
-    rescue StandardError
-      @out.puts(line.chomp)
-      ev
-    end
-
-    def to_result(event)
-      event && Result.from_event(event)
-    rescue StandardError
-      nil
     end
 
     def finish(rv, usage)
@@ -230,11 +224,11 @@ module ReviewRun
       say "WARNING: findings-metadata: #{e.message}"
     end
 
-    def log_usage(project:, topic:, version:, route:, phase:, model:, status:, result:)
+    def log_usage(rv, phase, status, result)
       Usage.append_log(File.join(@state_dir, 'usage.log'), {
-                         'time' => @clock.call.iso8601, 'project' => project, 'topic' => topic,
-                         'version' => version, 'route' => route, 'phase' => phase, 'model' => model,
-                         'status' => status, 'cost_usd' => result&.cost_usd || 0.0,
+                         'time' => @clock.call.iso8601, 'project' => rv.project, 'topic' => rv.topic,
+                         'version' => rv.version, 'route' => rv.route, 'phase' => phase.name,
+                         'model' => phase.model, 'status' => status, 'cost_usd' => result&.cost_usd || 0.0,
                          'tokens' => result&.tokens || Usage::TOKEN_KEYS.to_h { |k| [k, 0] }
                        })
     end
@@ -270,13 +264,6 @@ module ReviewRun
 
     def warn_api_key
       say API_KEY_WARNING unless ENV['ANTHROPIC_API_KEY'].to_s.empty?
-    end
-
-    def claude_version
-      out, = Open3.capture2e(CHILD_ENV, @claude_bin, '--version', unsetenv_others: false)
-      out.split.first || 'unknown'
-    rescue SystemCallError
-      'unknown'
     end
 
     def fail_review(project, topic, msg)
