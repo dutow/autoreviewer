@@ -32,7 +32,57 @@ def spine(text)
 end
 
 template = File.read(TEMPLATE)
+PHASES_ROOT = File.join(WORKSPACE, '.claude/review-phases')
+PHASE_TEMPLATE = File.join(PHASES_ROOT, '_git-pr')
 drifted = false
+
+def show_diff(label, expected, actual_label, actual)
+  a = Tempfile.new(['expected', '.md'])
+  a.write(expected)
+  a.close
+  b = Tempfile.new(['actual', '.md'])
+  b.write(actual)
+  b.close
+  system('diff', '-u', '--label', label, '--label', actual_label, a.path, b.path)
+  File.unlink(a.path, b.path)
+end
+
+def phase_files(dir)
+  Dir.children(dir).select { |f| File.file?(File.join(dir, f)) }.sort
+end
+
+# Returns true when the project's phase dir matches the template.
+def check_phases(proj)
+  tdir = PHASE_TEMPLATE
+  pdir = File.join(PHASES_ROOT, proj)
+  unless File.directory?(pdir)
+    warn "#{proj}: MISSING #{pdir}"
+    return false
+  end
+
+  ok = true
+  tfiles = phase_files(tdir)
+  tfiles.each do |f|
+    path = File.join(pdir, f)
+    unless File.exist?(path)
+      warn "#{proj}: MISSING #{path}"
+      ok = false
+      next
+    end
+    expected = spine(File.read(File.join(tdir, f)).gsub('<PROJECT>', proj))
+    actual = spine(File.read(path))
+    next if expected == actual
+
+    ok = false
+    puts "#{proj}: DRIFT #{f}"
+    show_diff("template(#{proj})/#{f}", expected, path, actual)
+  end
+  (phase_files(pdir) - tfiles).each do |f|
+    warn "#{proj}: EXTRA #{File.join(pdir, f)}"
+    ok = false
+  end
+  ok
+end
 
 PROJECTS.each do |proj|
   cmd_path = File.join(WORKSPACE, '.claude/commands', proj, 'review-patch.md')
@@ -46,19 +96,16 @@ PROJECTS.each do |proj|
   actual = spine(File.read(cmd_path))
 
   if expected == actual
-    puts "#{proj}: OK"
+    cmd_ok = true
   else
-    drifted = true
+    cmd_ok = false
     puts "#{proj}: DRIFT"
-    a = Tempfile.new(['expected', '.md'])
-    a.write(expected)
-    a.close
-    b = Tempfile.new(['actual', '.md'])
-    b.write(actual)
-    b.close
-    system('diff', '-u', '--label', "template(#{proj})", '--label', cmd_path, a.path, b.path)
-    File.unlink(a.path, b.path)
+    show_diff("template(#{proj})", expected, cmd_path, actual)
   end
+
+  phases_ok = File.directory?(PHASE_TEMPLATE) ? check_phases(proj) : true
+  drifted ||= !(cmd_ok && phases_ok)
+  puts "#{proj}: OK" if cmd_ok && phases_ok
 end
 
 exit(drifted ? 1 : 0)
