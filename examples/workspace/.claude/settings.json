@@ -9,6 +9,16 @@
           }
         ]
       }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$REVIEW_DONE_FILE$REVIEW_RUN\" ] || exit 0; echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}'"
+          }
+        ]
+      }
     ]
   }
 }
