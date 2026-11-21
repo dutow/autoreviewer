@@ -1,0 +1,62 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Re-run a reviewed version through a route in a throwaway clone of the workspace.
+#   review-replay [--keep-worktree] <project> <topic> <vN> <route>
+# Needs the live review/<topic> still at vN. Output: replay/<project>/<topic>/vN-<route>-<n>/
+
+require 'optparse'
+require_relative '../lib/review_replay/workspace'
+
+$stdout.sync = true
+
+def env_or(name, default)
+  v = ENV[name].to_s
+  v.empty? ? default : v
+end
+
+base_dir = File.expand_path('..', __dir__)
+opts = {}
+parser = OptionParser.new do |o|
+  o.banner = 'usage: review-replay [--keep-worktree] <project> <topic> <vN> <route>'
+  o.on('--keep-worktree', 'leave the review worktree in place') { opts[:keep] = true }
+end
+
+begin
+  args = parser.parse(ARGV)
+  raise OptionParser::InvalidArgument, 'expected <project> <topic> <vN> <route>' unless args.size == 4
+rescue OptionParser::ParseError => e
+  warn "#{e.message}\n#{parser.help}"
+  exit 1
+end
+
+project, topic, version, route = args
+begin
+  wsp = ReviewReplay::Workspace.new(workspace_dir: env_or('WORKSPACE_DIR', File.join(base_dir, 'workspace')),
+                                    replay_root: env_or('REPLAY_DIR', File.join(base_dir, 'replay')))
+  run = wsp.prepare(project: project, topic: topic, version: version, route: route)
+rescue ReviewReplay::ReplayError => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end
+
+puts "=== replay #{project}/#{topic} v#{run.version}, route #{route} in #{run.dir}"
+ok = false
+meta = {}
+begin
+  cmd = [File.join(base_dir, 'bin', 'review-run'), '--replay', '--route', route, project, topic]
+  ok = system({ 'WORKSPACE_DIR' => run.ws, 'STATE_DIR' => run.state }, *cmd, chdir: run.ws) || false
+rescue Interrupt
+  warn 'Interrupted'
+ensure
+  begin
+    meta = wsp.finish(run, ok: ok)
+  ensure
+    wsp.cleanup(run) unless opts[:keep]
+  end
+end
+
+puts "WARNING: live #{project}/review/#{topic} changed during the replay" if meta['inputs_changed']
+puts "replay: #{run.dir}"
+puts "compare: bin/review-compare #{run.dir} #{run.reference}"
+exit(ok ? 0 : 1)

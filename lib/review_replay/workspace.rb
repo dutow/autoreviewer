@@ -19,6 +19,8 @@ module ReviewReplay
       @live = File.realpath(workspace_dir)
       @root = File.expand_path(replay_root)
       @out = out
+    rescue SystemCallError
+      raise ReplayError, "workspace not found: #{workspace_dir}"
     end
 
     def prepare(project:, topic:, version:, route:)
@@ -39,6 +41,16 @@ module ReviewReplay
         raise ReplayError, "prepare failed: #{e.message}"
       end
       run
+    end
+
+    def finish(run, ok:)
+      path = File.join(run.dir, 'replay.json')
+      meta = JSON.parse(File.read(path)).merge(
+        'finished_at' => Time.now.utc.iso8601, 'ok' => ok,
+        'inputs_changed' => inputs_changed?(run), 'cost_usd' => replay_cost(run)
+      )
+      File.write(path, "#{JSON.pretty_generate(meta)}\n")
+      meta
     end
 
     def inputs_changed?(run)
@@ -185,6 +197,15 @@ module ReviewReplay
       meta = { 'project' => run.project, 'topic' => run.topic, 'version' => run.version, 'route' => run.route,
                'reference' => run.reference, 'head' => run.head, 'created_at' => Time.now.utc.iso8601 }
       File.write(File.join(run.dir, 'replay.json'), "#{JSON.pretty_generate(meta)}\n")
+    end
+
+    def replay_cost(run)
+      usage = File.join(run.ws, run.project, 'findings', run.topic, "v#{run.version}", 'usage.json')
+      return nil unless File.file?(usage)
+
+      (JSON.parse(File.read(usage))['phases'] || []).sum { |p| p['cost_usd'].to_f }.round(4)
+    rescue JSON::ParserError
+      nil
     end
 
     def live_review(project, topic)
