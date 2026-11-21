@@ -122,6 +122,26 @@ class ReviewPruneTest < Minitest::Test
     end
   end
 
+  def test_topic_with_replay_worktree_is_kept
+    with_workspace do |dir|
+      pdir = proj(dir, 'pg')
+      master = File.join(pdir, 'master')
+      git = ->(*a) { system('git', '-C', master, *a, out: File::NULL, err: File::NULL) or flunk "git #{a.join(' ')}" }
+      FileUtils.mkdir_p(master)
+      git.('init', '-q', '-b', 'main')
+      git.('-c', 'user.email=t@e', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'base')
+      git.('worktree', 'add', '-q', '--detach', File.join(pdir, 'review', 'pr1'), 'HEAD')
+      git.('worktree', 'add', '-q', '--detach', File.join(pdir, 'review', 'pr2'), 'HEAD')
+      replay = File.join(dir, 'replay', 'pg', 'pr1', 'v1-full-1', 'ws', 'pg', 'review', 'pr1')
+      git.('worktree', 'add', '-q', '--detach', replay, 'HEAD')
+      %w[pr1 pr2].each { |t| mkdir_aged(File.join(pdir, 'builds', t), 30) }
+      %w[pr1 pr2].each { |t| FileUtils.touch(File.join(pdir, 'review', t), mtime: Time.now - 30 * DAY) }
+      assert_equal [['pg', 'pr2']], topics(pruner(dir).candidates)
+      FileUtils.rm_rf(File.join(dir, 'replay'))
+      assert_equal [['pg', 'pr1'], ['pg', 'pr2']], topics(pruner(dir).candidates)
+    end
+  end
+
   def test_run_without_master_repo_still_removes_dirs
     with_workspace do |dir|
       mkdir_aged(File.join(proj(dir, 'pg'), 'review', 'pr1'), 30, file: 'metadata.json')

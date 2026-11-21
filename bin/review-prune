@@ -5,7 +5,8 @@
 # (<name>/review/<topic>) older than REVIEW_PRUNE_DAYS (default 7, 0 disables).
 # A topic's age is the newest mtime across its builds dir, status.yaml files and
 # review dir, so a re-reviewed topic starts over. Keeps builds/master, builds
-# named after a branches/ checkout, and topics whose review tmux window is open.
+# named after a branches/ checkout, topics whose review tmux window is open, and
+# topics a bin/review-replay run has a worktree for.
 # Also removes runner log dirs (state/logs/<name>/) whose newest file is older
 # than the same cutoff.
 #
@@ -31,7 +32,7 @@ class ReviewPrune
     Dir.glob(File.join(@workspace_dir, '*', 'project.yaml')).sort.flat_map do |yaml|
       project_dir = File.dirname(yaml)
       project = File.basename(project_dir)
-      keep = %w[master] + children(File.join(project_dir, 'branches'))
+      keep = %w[master] + children(File.join(project_dir, 'branches')) + replaying(project_dir, project)
       names = %w[builds review].flat_map { |d| children(File.join(project_dir, d)) }
       names.uniq.sort.filter_map do |topic|
         next if keep.include?(topic) || active.include?("#{project}-#{topic}")
@@ -99,6 +100,22 @@ class ReviewPrune
 
   def children(dir)
     File.directory?(dir) ? Dir.children(dir) : []
+  end
+
+  # topics with a bin/review-replay worktree (<...>/<project>/review/<topic> outside this workspace)
+  def replaying(project_dir, project)
+    master = File.join(project_dir, 'master')
+    return [] unless File.exist?(File.join(master, '.git'))
+
+    live = File.join(File.realpath(project_dir), 'review')
+    out = `git -C #{Shellwords.escape(master)} worktree list --porcelain 2>/dev/null`
+    out.scan(/^worktree (.+)$/).flatten.filter_map do |path|
+      parent = File.dirname(path)
+      next if parent == live || File.basename(parent) != 'review' || File.basename(File.dirname(parent)) != project
+      File.basename(path) if File.directory?(path)
+    end
+  rescue SystemCallError
+    []
   end
 
   def git(dir, *args)
