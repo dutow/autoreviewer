@@ -1,8 +1,10 @@
 module ReviewRun
-  Context = Struct.new(:project, :topic, :version, :outdir, :prev_dir, :index, :total, keyword_init: true)
+  Context = Struct.new(:project, :topic, :version, :outdir, :prev_dir, :index, :total, :replay, keyword_init: true)
 
   module Prompt
     FRONTMATTER = /\A---[ \t]*\n.*?^---[ \t]*\n/m
+    REPLAY_NOTE = 'Replay of a past review: if discussion.txt already exists in the output directory, ' \
+                  'it is the discussion as of the original review; use it as it is and do not fetch or regenerate it.'
 
     def self.render(manifest:, phase:, ctx:)
       parts = []
@@ -22,7 +24,7 @@ module ReviewRun
     end
 
     def self.header(phase, ctx)
-      <<~H
+      h = <<~H
         # Automated review phase
 
         Project: #{ctx.project}
@@ -37,6 +39,7 @@ module ReviewRun
         Do not start background agents or background tasks; wait for every subagent to finish before you end.
         All paths are relative to the workspace root (the current directory).
       H
+      ctx.replay ? "#{h}#{REPLAY_NOTE}\n" : h
     end
   end
 end

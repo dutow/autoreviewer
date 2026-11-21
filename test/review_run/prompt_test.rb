@@ -49,6 +49,19 @@ class PromptTest < Minitest::Test
     end
   end
 
+  def test_header_replay_note
+    with_setup do |m, ph|
+      out = ReviewRun::Prompt.render(manifest: m, phase: ph, ctx: ctx(replay: true))
+      assert_includes out, "(the current directory).\n#{ReviewRun::Prompt::REPLAY_NOTE}\n\nbody t1"
+    end
+  end
+
+  def test_header_no_replay_note_by_default
+    with_setup do |m, ph|
+      refute_includes ReviewRun::Prompt.render(manifest: m, phase: ph, ctx: ctx), 'Replay of a past review'
+    end
+  end
+
   def test_prev_dir_shown
     with_setup do |m, ph|
       out = ReviewRun::Prompt.render(manifest: m, phase: ph, ctx: ctx(prev_dir: 'postgres/findings/t1/v2'))

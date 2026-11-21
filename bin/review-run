@@ -2,7 +2,7 @@
 # frozen_string_literal: true
 
 # Headless review: one `claude -p` session per phase of the project's route.
-#   review-run [--done-file PATH] [--route NAME] [--render PHASE] <project> <topic>
+#   review-run [--done-file PATH] [--route NAME] [--render PHASE] [--replay] <project> <topic>
 #   review-run [--done-file PATH] --commits <project> <from>..<to>
 
 require 'optparse'
@@ -18,12 +18,13 @@ end
 
 opts = {}
 parser = OptionParser.new do |o|
-  o.banner = 'usage: review-run [--done-file PATH] [--route NAME] [--render PHASE] <project> <topic>
+  o.banner = 'usage: review-run [--done-file PATH] [--route NAME] [--render PHASE] [--replay] <project> <topic>
 #   review-run [--done-file PATH] --commits <project> <from>..<to>'
   o.on('--done-file PATH', 'touch PATH when finished (success or failure)') { |v| opts[:done_file] = v }
   o.on('--route NAME', 'route from phases.yaml (default: review.route, else full)') { |v| opts[:route] = v }
   o.on('--commits', 'commit review of <project> <range> (single run)') { opts[:commits] = true }
   o.on('--render PHASE', 'print the rendered prompt of PHASE and exit') { |v| opts[:render] = v }
+  o.on('--replay', 'replay of a past review (bin/review-replay): adds a header note') { opts[:replay] = true }
 end
 
 ok = false
@@ -37,7 +38,8 @@ begin
     base_dir: base_dir,
     workspace_dir: File.expand_path(env_or('WORKSPACE_DIR', File.join(base_dir, 'workspace'))),
     state_dir: File.expand_path(env_or('STATE_DIR', File.join(base_dir, 'state'))),
-    claude_bin: env_or('CLAUDE_BIN', 'claude')
+    claude_bin: env_or('CLAUDE_BIN', 'claude'),
+    replay: opts[:replay] || false
   )
   if opts[:commits]
     ok = runner.run_commits(project: project, range: topic)

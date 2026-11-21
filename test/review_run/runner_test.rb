@@ -91,10 +91,10 @@ class RunnerTest < Minitest::Test
     out
   end
 
-  def runner(sleeper: ->(s) { @slept << s }, clock: -> { Time.now })
+  def runner(sleeper: ->(s) { @slept << s }, clock: -> { Time.now }, **opts)
     @out = StringIO.new
     ReviewRun::Runner.new(base_dir: @base, workspace_dir: @ws, state_dir: @state,
-                          claude_bin: FAKE, out: @out, sleeper: sleeper, clock: clock)
+                          claude_bin: FAKE, out: @out, sleeper: sleeper, clock: clock, **opts)
   end
 
   def run_topic(**kw)
@@ -300,6 +300,16 @@ class RunnerTest < Minitest::Test
     assert_equal [false, false, false], calls.map { |c| c['done_file_env'] }
     assert_equal [{ 'REVIEW_RUN' => '1', 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS' => '1' }] * 3, calls.map { |c| c['env'] }
     refute File.exist?(File.join(@root, 'done'))
+  end
+
+  def test_replay_flag_reaches_prompt
+    assert run_topic(replay: true), output
+    assert_equal [true, true, true], calls.map { |c| c['replay_note'] }
+  end
+
+  def test_no_replay_note_by_default
+    assert run_topic, output
+    assert_equal [false, false, false], calls.map { |c| c['replay_note'] }
   end
 
   def test_skip_if_skips_phase
@@ -589,6 +599,16 @@ class RunnerTest < Minitest::Test
     out, st = cli('--render', 'a', 'p', 't1')
     assert st.success?, out
     assert_includes out, "Phase: a (1 of 3)\n"
+    refute_includes out, 'Replay of a past review'
     assert_empty calls
+  end
+
+  def test_cli_replay_flag
+    out, st = cli('--replay', '--render', 'a', 'p', 't1')
+    assert st.success?, out
+    assert_includes out, ReviewRun::Prompt::REPLAY_NOTE
+    out, st = cli('--replay', 'p', 't1')
+    assert st.success?, out
+    assert_equal [true, true, true], calls.map { |c| c['replay_note'] }
   end
 end

@@ -29,7 +29,8 @@ module ReviewRun
     CommitPhase = Struct.new(:name, :model, :effort)
 
     def initialize(base_dir:, workspace_dir:, state_dir:, claude_bin: 'claude', out: $stdout,
-                   sleeper: ->(s) { sleep s }, clock: -> { Time.now })
+                   sleeper: ->(s) { sleep s }, clock: -> { Time.now }, replay: false)
+      @replay = replay
       @base_dir = base_dir
       @workspace_dir = workspace_dir
       @state_dir = state_dir
@@ -157,7 +158,7 @@ module ReviewRun
 
     def context(rv, idx)
       Context.new(project: rv.project, topic: rv.topic, version: "v#{rv.version}", outdir: rv.outdir,
-                  prev_dir: rv.prev_dir, index: idx + 1, total: rv.phases.size)
+                  prev_dir: rv.prev_dir, index: idx + 1, total: rv.phases.size, replay: @replay)
     end
 
     # resume: output present and last run of the phase was not cut short
