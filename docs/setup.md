@@ -250,6 +250,8 @@ The reference `discussion.txt` is copied into the replay findings dir before the
 
 `review-compare` matches the POST and POST-MINOR points of the replay against the reference: matched, only in the reference, only in the replay, with a one-line reason each.
 It adds both sides' usage totals to the json.
+It refuses a replay without `05-summary.md`, a reference dir other than the one in `replay.json`, and a second run of a different topic or version.
+`--table` marks runs that failed (`[replay failed]`) or whose live review changed under them (`[inputs changed]`); leave those out of the gate.
 Read the `only_reference` items in the md before trusting the counts.
 
 Replays spend subscription tokens like a review, plus a dollar or two per compare.
@@ -261,7 +263,7 @@ To delete a run, `rm -rf replay/<project>/<topic>/<run>`; if the replay was kill
 Builds and review worktrees pile up: a postgres topic is a few GB, so a few months of reviews fill a disk.
 `bin/review-prune` removes `<name>/builds/<topic>/` and `<name>/review/<topic>/` for every topic untouched for `REVIEW_PRUNE_DAYS` days (default 7, `0` disables).
 A topic's age is the newest mtime across its build dir, its `status.yaml` files and its review worktree, so a re-review restarts the clock.
-It never touches `builds/master`, builds named after a `branches/` checkout (the stable-branch installs other projects build against), or a topic whose review tmux window is still open.
+It never touches `builds/master`, builds named after a `branches/` checkout (the stable-branch installs other projects build against), a topic whose review tmux window is still open, or a topic a replay is running on (it has a worktree under `replay/`).
 Findings are untouched: they live in `findings/` and are committed.
 It also removes runner log dirs under `state/logs/` whose newest file is older than the same cutoff; it finds the state dir like the queue does (`STATE_DIR`, default `state/`).
 

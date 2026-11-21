@@ -66,6 +66,7 @@ module ReviewReplay
       raise ReplayError, "#{File.expand_path(replay_dir)}: not a replay run" unless a.run_dir
 
       b = resolve(reference_dir)
+      check_pair(a, b)
       md = File.join(a.run_dir, "compare-#{b.label}.md")
       json = File.join(a.run_dir, "compare-#{b.label}.json")
       FileUtils.rm_f([md, json])
@@ -95,6 +96,38 @@ module ReviewReplay
       true
     end
 
+    # same project/topic/version on both sides, and a replay that got as far as a summary
+    def check_pair(a, b)
+      raise ReplayError, "#{a.run_dir}: replay has no 05-summary.md" unless File.file?(File.join(a.findings_dir, '05-summary.md'))
+
+      meta = run_meta(a.run_dir)
+      if b.run_dir
+        other = run_meta(b.run_dir)
+        keys = %w[project topic version]
+        return if other.values_at(*keys) == meta.values_at(*keys)
+
+        raise ReplayError, "#{b.run_dir} replays #{desc(other)}, #{a.run_dir} replays #{desc(meta)}"
+      elsif meta['reference'] && real(b.findings_dir) != real(meta['reference'])
+        raise ReplayError, "#{b.findings_dir} is not the reference of #{a.run_dir} (#{meta['reference']})"
+      end
+    end
+
+    def run_meta(run_dir)
+      JSON.parse(File.read(File.join(run_dir, 'replay.json')))
+    rescue JSON::ParserError, SystemCallError
+      {}
+    end
+
+    def desc(meta)
+      "#{meta['project']}/#{meta['topic']} v#{meta['version']}"
+    end
+
+    def real(path)
+      File.realpath(path)
+    rescue SystemCallError
+      File.expand_path(path)
+    end
+
     def load(json)
       return [nil, 'missing'] unless File.file?(json)
 
@@ -110,9 +143,15 @@ module ReviewReplay
         project, topic, run = path.split('/')[-4..-2]
         label = File.basename(path, '.json').delete_prefix('compare-')
         data = JSON.parse(File.read(path))
-        c = data['counts'] || {}
+        c = data['counts']
+        next "#{project}/#{topic} #{run} vs #{label}: invalid compare (no counts)" unless c.is_a?(Hash)
+
+        meta = run_meta(File.dirname(path))
+        flags = []
+        flags << ' [replay failed]' if meta['ok'] == false
+        flags << ' [inputs changed]' if meta['inputs_changed']
         "#{project}/#{topic} #{run} vs #{label}: matched #{c['matched']}, only-ref #{c['only_reference']}, " \
-          "only-replay #{c['only_replay']}, cost #{money(data, 'replay')} vs #{money(data, 'reference')}"
+          "only-replay #{c['only_replay']}, cost #{money(data, 'replay')} vs #{money(data, 'reference')}#{flags.join}"
       rescue JSON::ParserError
         "#{project}/#{topic} #{run} vs #{label}: unreadable"
       end

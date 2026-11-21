@@ -20,10 +20,10 @@ class CompareTest < Minitest::Test
   def setup
     @root = File.realpath(Dir.mktmpdir)
     @replay_root = File.join(@root, 'replay')
-    @run = make_run('v2-full-1', usage: [1.5, 2.0])
     @ref = File.join(@root, 'ref')
     FileUtils.mkdir_p(@ref)
     File.write(File.join(@ref, '05-summary.md'), "ref summary\n")
+    @run = make_run('v2-full-1', usage: [1.5, 2.0])
     @calls_file = File.join(@root, 'calls.jsonl')
   end
 
@@ -31,12 +31,14 @@ class CompareTest < Minitest::Test
     FileUtils.rm_rf(@root)
   end
 
-  def make_run(name, usage: nil)
+  def make_run(name, usage: nil, **meta)
     dir = File.join(@replay_root, 'p', 't1', name)
     findings = File.join(dir, 'ws', 'p', 'findings', 't1', 'v2')
     FileUtils.mkdir_p([findings, File.join(dir, 'state')])
     File.write(File.join(findings, '05-summary.md'), "summary #{name}\n")
-    File.write(File.join(dir, 'replay.json'), JSON.generate('project' => 'p', 'topic' => 't1', 'version' => 2))
+    File.write(File.join(dir, 'replay.json'),
+               JSON.generate({ 'project' => 'p', 'topic' => 't1', 'version' => 2, 'reference' => @ref }
+                               .merge(meta.transform_keys(&:to_s))))
     File.symlink('ws/p/findings/t1/v2', File.join(dir, 'findings'))
     if usage
       phases = usage.each_with_index.map do |c, i|
@@ -158,6 +160,44 @@ class CompareTest < Minitest::Test
     data = JSON.parse(File.read(File.join(@run, 'compare-v2-single-1.json')))
     assert_in_delta 1.0, data.dig('usage', 'reference', 'cost_usd')
     assert_includes out, "cost replay $3.50 vs reference $1.00\n"
+  end
+
+  def test_refuses_replay_without_summary
+    File.delete(File.join(@run, 'findings', '05-summary.md'))
+    out, st = cli(@run, @ref, plan_path: fake_writes)
+    refute st.success?
+    assert_includes out, "ERROR: #{@run}: replay has no 05-summary.md"
+    refute File.exist?(@calls_file)
+  end
+
+  def test_refuses_wrong_reference
+    other = File.join(@root, 'other')
+    FileUtils.mkdir_p(other)
+    File.write(File.join(other, '05-summary.md'), "other\n")
+    out, st = cli(@run, other, plan_path: fake_writes)
+    refute st.success?
+    assert_includes out, "ERROR: #{other} is not the reference of #{@run} (#{@ref})"
+    refute File.exist?(@calls_file)
+  end
+
+  def test_refuses_run_of_other_version
+    other = make_run('v3-single-1', version: 3)
+    out, st = cli(@run, other, plan_path: fake_writes(label: 'v3-single-1'))
+    refute st.success?
+    assert_includes out, "ERROR: #{other} replays p/t1 v3, #{@run} replays p/t1 v2"
+    refute File.exist?(@calls_file)
+  end
+
+  def test_table_flags_failed_changed_and_invalid
+    bad = make_run('v2-full-2', usage: [1.0], ok: false, inputs_changed: true)
+    assert cli(bad, @ref, plan_path: fake_writes(run: bad)).last.success?
+    File.write(File.join(@run, 'compare-reference.json'), JSON.generate(VALID))
+    out, st = cli('--table')
+    assert st.success?, out
+    assert_equal ["p/t1 v2-full-1 vs reference: invalid compare (no counts)\n",
+                  "p/t1 v2-full-2 vs reference: matched 1, only-ref 0, only-replay 1, cost $1.00 vs n/a " \
+                  "[replay failed] [inputs changed]\n"],
+                 out.lines
   end
 
   def test_table_lists_compares
