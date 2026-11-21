@@ -217,6 +217,45 @@ From the workspace directory, inside the container (`task shell`):
 The topic must already be ingested (`review/<topic>/metadata.json` exists).
 Exit status is 0 on success, 1 on failure.
 
+### Replaying a review
+
+A replay re-runs a past review version through a route without touching the workspace repo.
+It is how a route is checked before a project switches to it: replay a few reviewed topics on the new route and compare their postable points with the original reviews.
+Replaying some of the same topics on `single` again shows how much two runs differ on their own.
+
+```
+task replay -- <project> <topic> <vN> <route>    # tmux window "replay", watch with task attach
+task compare -- <run dir> <reference dir>         # one Opus session, a few minutes
+task compare -- --table                           # one line per compare
+```
+
+Inside the container the same commands are `bin/review-replay [--keep-worktree] <project> <topic> <vN> <route>` and `bin/review-compare`, run from the repo root.
+`review-replay` prints the run dir and the `review-compare` command line for it when it ends.
+
+A replay needs the live `review/<topic>` still at vN (`metadata.json` version N), and reuses that ingest and build.
+A topic that got a newer version since, or was pruned, cannot be replayed.
+`builds/` is shared with the live queue, so avoid topics likely to get a new version while the replay runs; the replay warns when the live review changed under it.
+
+Each run gets `replay/<project>/<topic>/vN-<route>-<n>/`:
+
+- `ws/` - a `git clone --shared` of the workspace with no remote.
+  vN and later versions of the topic are dropped from it, `master/`, `branches/` and `builds/` are symlinks to the live ones, and `review/<topic>` is its own worktree at the live review HEAD, removed at the end unless `--keep-worktree`.
+  Phase commits land in this clone only.
+- `findings` - link to the replayed findings dir in `ws/`.
+- `state/` - the runner's state dir (logs, `usage.log`, pause file), separate from the queue's.
+- `replay.json` - project, topic, version, route, reference dir, review HEAD, start and end time, `ok`, `inputs_changed`, `cost_usd`.
+- `compare-<label>.md` and `.json` - written by `review-compare`; `<label>` is `reference` for the original review, or the other run's dir name when comparing two replays.
+
+The reference `discussion.txt` is copied into the replay findings dir before the run, and `review-run --replay` tells each phase to use it instead of fetching the thread again, so the replay sees the thread as the original review did.
+
+`review-compare` matches the POST and POST-MINOR points of the replay against the reference: matched, only in the reference, only in the replay, with a one-line reason each.
+It adds both sides' usage totals to the json.
+Read the `only_reference` items in the md before trusting the counts.
+
+Replays spend subscription tokens like a review, plus a dollar or two per compare.
+`replay/` is gitignored and not indexed by the webapp.
+To delete a run, `rm -rf replay/<project>/<topic>/<run>`; if the replay was killed, also run `git -C workspace/<project>/master worktree prune`.
+
 ## Pruning old builds and worktrees
 
 Builds and review worktrees pile up: a postgres topic is a few GB, so a few months of reviews fill a disk.

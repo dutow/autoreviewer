@@ -139,9 +139,10 @@ The runner calls `bin/findings-metadata` (which writes `metadata.json` in the fi
 - `single` - the existing review command run as one headless session.
   The phase's `prompt` points at the command file, so the review behaves as before, and the run still gets logs and `usage.json`.
 - `full` - one session per phase, each with a focused prompt.
-  It is off until a quality check against `single` shows the findings hold up, so the examples set `route: single`.
+  The examples set `route: single` until replays on `full` hold up against `single` reviews (see [setup.md](setup.md#replaying-a-review)).
 
-Switch a project by changing `review.route`, or try one run with `bin/review-run --route full <project> <topic>` (see [setup.md](setup.md#running-by-hand)).
+Switch a project by changing `review.route`.
+To try a route on an already reviewed topic without touching the workspace repo, replay it: `bin/review-replay <project> <topic> <vN> full` (see [setup.md](setup.md#replaying-a-review)).
 `bin/review-run --render <phase> <project> <topic>` shows the exact prompt a phase gets.
 
 ## Git-PR projects (psp, pg_tde, ...)

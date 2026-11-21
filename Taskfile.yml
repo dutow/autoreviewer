@@ -129,6 +129,17 @@ tasks:
     desc: 'Remove builds and review worktrees older than REVIEW_PRUNE_DAYS: task prune -- [--dry-run] [--days N]'
     cmds: ['{{.COMPOSE}} run --rm --no-deps review-queue bin/review-prune {{.CLI_ARGS}}']
 
+  replay:
+    desc: 'Replay a past review in tmux: task replay -- <project> <topic> <vN> <route>'
+    dotenv: ['.env']
+    cmds:
+      - '{{.COMPOSE}} exec -w "$REPO_ROOT" review-queue tmux new-window -d -t reviews: -n replay "bin/review-replay {{.CLI_ARGS}}; echo; echo ''Press Enter to close...''; read"'
+
+  compare:
+    desc: 'Compare a replay: task compare -- <run dir> <reference dir> | --table'
+    dotenv: ['.env']
+    cmds: ['{{.COMPOSE}} exec -w "$REPO_ROOT" review-queue bin/review-compare {{.CLI_ARGS}}']
+
   test:
     desc: Run the script test suites in the container
     cmds:
