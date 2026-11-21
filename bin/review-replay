@@ -38,6 +38,9 @@ begin
 rescue ReviewReplay::ReplayError => e
   warn "ERROR: #{e.message}"
   exit 1
+rescue Interrupt
+  warn 'Interrupted'
+  exit 130
 end
 
 puts "=== replay #{project}/#{topic} v#{run.version}, route #{route} in #{run.dir}"

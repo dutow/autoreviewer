@@ -33,10 +33,10 @@ module ReviewReplay
         add_worktree(run)
         seed(run)
         write_meta(run)
-      rescue StandardError => e
+      rescue Exception => e # Ctrl-C too: must not leak a live worktree
         cleanup(run)
         FileUtils.rm_rf(run.dir) if run.dir
-        raise e if e.is_a?(ReplayError)
+        raise e if e.is_a?(ReplayError) || !e.is_a?(StandardError)
 
         raise ReplayError, "prepare failed: #{e.message}"
       end

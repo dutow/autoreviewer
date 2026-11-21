@@ -151,6 +151,15 @@ class ReplayWorkspaceTest < Minitest::Test
     assert_equal [live('p', 'master'), live('p', 'review', 't1')].sort, worktrees.sort
   end
 
+  def test_interrupted_prepare_leaves_nothing
+    interrupted = Class.new(ReviewReplay::Workspace) do
+      def seed(_run) = raise(Interrupt)
+    end.new(workspace_dir: @live, replay_root: @replay_root, out: @out)
+    assert_raises(Interrupt) { interrupted.prepare(project: 'p', topic: 't1', version: 'v2', route: 'full') }
+    assert_empty Dir.children(File.join(@replay_root, 'p', 't1'))
+    assert_equal [live('p', 'master'), live('p', 'review', 't1')].sort, worktrees.sort
+  end
+
   def test_inputs_changed_after_live_commit
     run = prepare
     refute @wsp.inputs_changed?(run)
