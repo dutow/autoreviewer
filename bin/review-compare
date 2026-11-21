@@ -1,0 +1,48 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Match the postable points of a replay against a reference review (one claude session).
+#   review-compare <replay run dir> <reference dir>
+#   review-compare --table [replay root]
+# Writes compare-<label>.md and .json into the replay run dir.
+
+require 'optparse'
+require_relative '../lib/review_replay/compare'
+
+$stdout.sync = true
+
+def env_or(name, default)
+  v = ENV[name].to_s
+  v.empty? ? default : v
+end
+
+base_dir = File.expand_path('..', __dir__)
+opts = {}
+parser = OptionParser.new do |o|
+  o.banner = "usage: review-compare <replay run dir> <reference dir>\n       review-compare --table [replay root]"
+  o.on('--table', 'one line per compare under the replay root') { opts[:table] = true }
+end
+
+begin
+  args = parser.parse(ARGV)
+  ok_args = opts[:table] ? args.size <= 1 : args.size == 2
+  raise OptionParser::InvalidArgument, 'wrong number of arguments' unless ok_args
+rescue OptionParser::ParseError => e
+  warn "#{e.message}\n#{parser.help}"
+  exit 1
+end
+
+if opts[:table]
+  root = args.first || env_or('REPLAY_DIR', File.join(base_dir, 'replay'))
+  lines = ReviewReplay::Compare.table(root)
+  puts(lines.empty? ? "no compares under #{root}" : lines)
+  exit 0
+end
+
+begin
+  ok = ReviewReplay::Compare.run(replay_dir: args[0], reference_dir: args[1], claude_bin: env_or('CLAUDE_BIN', 'claude'))
+rescue ReviewReplay::ReplayError => e
+  puts "ERROR: #{e.message}"
+  ok = false
+end
+exit(ok ? 0 : 1)

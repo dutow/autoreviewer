@@ -2,7 +2,7 @@
 # frozen_string_literal: true
 
 # Test double for `claude -p --output-format stream-json`.
-# Plan (FAKE_CLAUDE_PLAN, JSON): {"<phase>": {"write": [..], "commit": true, "exit": 0,
+# Plan (FAKE_CLAUDE_PLAN, JSON): {"<phase>": {"write": [..], "files": {"<path>": "<body>"}, "commit": true, "exit": 0,
 #   "no_result": false, "limit_first": false, "limit_times": 0, "limit_text": "...",
 #   "limit_event": {rate_limit_info}, "rate_limit": {rate_limit_info}, "noise": false, "text": "..."}}
 # limit_first / limit_times: the first 1 / N calls for the phase hit the usage limit: error result
@@ -60,6 +60,12 @@ if prior.count { |c| c['phase'] == phase } < limit_times
   exit 1
 end
 rate_limit_event(step['rate_limit'], session) if step['rate_limit']
+
+(step['files'] || {}).each do |path, body|
+  path = File.expand_path(path)
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, body)
+end
 
 files = step['write'].map { |name| File.join(outdir.to_s, name) }
 files.each do |path|
