@@ -45,7 +45,7 @@ class CostStats
   private
 
   def grouped
-    @scope.where.not(cost_usd: nil).where.not(reviewed_at: nil)
+    @scope.where.not(cost_usd: nil).where("#{DAY} IS NOT NULL")
           .group(Arel.sql(DAY), Arel.sql(REREVIEW))
           .pluck(Arel.sql(DAY), Arel.sql(REREVIEW), Arel.sql("COUNT(*)"), Arel.sql("SUM(review_versions.cost_usd)"))
   end

@@ -45,6 +45,13 @@ class CostStatsTest < ActiveSupport::TestCase
     assert_equal 0, s.skipped
   end
 
+  test "day sqlite cannot parse is skipped" do
+    rv "c", "t1", 1, 7.0, "20266-11-22T10:00:00Z"
+    s = CostStats.new(ReviewVersion.where(project: "c"))
+    assert_empty s.days
+    assert_equal 1, s.skipped
+  end
+
   test "empty scope" do
     s = CostStats.new(ReviewVersion.none)
     assert_empty s.days
