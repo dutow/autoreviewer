@@ -179,7 +179,7 @@ A failed phase stops the review, prints `FAILED: <reason>`, and opens a tmux win
 - `<project>/findings/<topic>/vNN/usage.json` - committed with the findings: route, claude version, per-phase tokens, cost and duration, and totals.
   Runs cut short by the usage limit are in it too, with status `limit`, so the totals are the full cost of the review.
   A re-run that runs no phase leaves `usage.json` as it is, and creates none.
-  The webapp shows the cost on the review.
+  The webapp shows the cost on the review, and per-day totals (first review vs re-review, by project and route) on `/costs`.
 
 ### Usage limit pause
 

@@ -8,6 +8,7 @@ Rails.application.routes.draw do
   delete "logout" => "sessions#destroy", as: :logout
 
   get "search" => "search#index", as: :search
+  get "costs" => "costs#index", as: :costs
 
   # glob keeps the real extension (format: false), same as the findings file route
   get "public(/*relpath)" => "public_files#show", as: :public_file, format: false

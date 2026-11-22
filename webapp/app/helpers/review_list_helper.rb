@@ -1,5 +1,5 @@
 module ReviewListHelper
-  LIST_PARAMS = %w[project versions min].freeze
+  LIST_PARAMS = %w[project versions min route].freeze
 
   SEVERITY_LABELS = {
     "bug" => "BUG", "likely_bug" => "LIKELY", "suspicious" => "SUSP",
