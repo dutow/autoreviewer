@@ -1,0 +1,87 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Test double for `codex exec --json`. Same plan/calls contract as fake-claude.
+# Plan (FAKE_CLAUDE_PLAN, JSON): {"<phase>": {"write": [..], "files": {"<path>": "<body>"}, "commit": true, "exit": 0,
+#   "limit_times": 0, "limit_text": "...", "fail_text": "...", "text": "..."}}
+# limit_times: the first N calls for the phase hit the usage limit (error + turn.failed, exit 1).
+# fail_text: turn.failed with that text, exit 1.
+
+require 'json'
+require 'fileutils'
+
+Encoding.default_external = Encoding::UTF_8
+
+ENV_SEEN = %w[REVIEW_DONE_FILE REVIEW_RUN CLAUDE_CODE_DISABLE_BACKGROUND_TASKS].freeze
+LIMIT_TEXT = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage " \
+             'to purchase more credits or try again at 3:05 PM.'
+
+if ARGV.include?('--version')
+  puts 'codex-cli 9.9.9'
+  exit 0
+end
+
+prompt = $stdin.read
+phase = prompt[/^Phase: (\S+)/, 1] || 'commits'
+outdir = prompt[/^Output directory: (.+)$/, 1]
+
+plan_file = ENV['FAKE_CLAUDE_PLAN']
+plan = plan_file && File.exist?(plan_file) ? JSON.parse(File.read(plan_file)) : {}
+step = { 'write' => [], 'commit' => true, 'exit' => 0, 'limit_times' => 0 }.merge(plan.fetch(phase, {}))
+
+calls_file = ENV['FAKE_CLAUDE_CALLS']
+prior = calls_file && File.exist?(calls_file) ? File.readlines(calls_file).map { |l| JSON.parse(l) } : []
+if calls_file
+  File.open(calls_file, 'a') do |f|
+    f.puts(JSON.generate('agent' => 'codex', 'phase' => phase, 'argv' => ARGV,
+                         'done_file_env' => ENV.key?('REVIEW_DONE_FILE'),
+                         'env' => ENV.slice(*ENV_SEEN), 'cwd' => Dir.pwd, 'outdir' => outdir,
+                         'replay_note' => prompt.include?('Replay of a past review:')))
+  end
+end
+
+$stdout.sync = true
+puts JSON.generate('type' => 'thread.started', 'thread_id' => "fake-#{phase}")
+puts JSON.generate('type' => 'turn.started')
+
+def fail_turn(text)
+  puts JSON.generate('type' => 'error', 'message' => text)
+  puts JSON.generate('type' => 'turn.failed', 'error' => { 'message' => text })
+  exit 1
+end
+
+if prior.count { |c| c['agent'] == 'codex' && c['phase'] == phase } < step['limit_times']
+  fail_turn(step['limit_text'] || LIMIT_TEXT)
+end
+fail_turn(step['fail_text']) if step['fail_text']
+
+(step['files'] || {}).each do |path, body|
+  path = File.expand_path(path)
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, body)
+end
+
+files = step['write'].map { |name| File.join(outdir.to_s, name) }
+files.each do |path|
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, "#{phase} output\n")
+end
+if step['commit'] && !files.empty?
+  system('git', 'add', '--', *files, out: File::NULL, err: File::NULL) &&
+    system('git', 'commit', '-q', '-m', "fake #{phase}", '--', *files, out: File::NULL, err: File::NULL)
+end
+
+cmd = "/usr/bin/zsh -lc \"write #{files.first}\""
+puts JSON.generate('type' => 'item.started',
+                   'item' => { 'id' => 'item_1', 'type' => 'command_execution', 'command' => cmd,
+                               'aggregated_output' => '', 'exit_code' => nil, 'status' => 'in_progress' })
+puts JSON.generate('type' => 'item.completed',
+                   'item' => { 'id' => 'item_1', 'type' => 'command_execution', 'command' => cmd,
+                               'aggregated_output' => '', 'exit_code' => 0, 'status' => 'completed' })
+puts JSON.generate('type' => 'item.completed',
+                   'item' => { 'id' => 'item_2', 'type' => 'agent_message', 'text' => step['text'] || 'done' })
+puts JSON.generate('type' => 'turn.completed',
+                   'usage' => { 'input_tokens' => 40, 'cached_input_tokens' => 30,
+                                'cache_write_input_tokens' => 0, 'output_tokens' => 20,
+                                'reasoning_output_tokens' => 0 })
+exit step['exit']
