@@ -1200,4 +1200,69 @@ class RunnerTest < Minitest::Test
   ensure
     ENV['PATH'] = path
   end
+
+  def test_both_guard_exempts_preexisting_dirt
+    both_setup
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('old.md'), "old\n")
+    git('add', "#{OUT_REL}/old.md")
+    git('commit', '-q', '-m', 'old')
+    File.write(outdir('old.md'), "edited\n")
+    File.write(outdir('discussion.txt'), "thread\n")
+    assert run_topic, output
+    assert_equal [%w[discovery codex], %w[review claude]], phase_agents
+    refute File.exist?(outdir('codex', 'discussion.txt'))
+    refute usage.key?('discovery_dirty')
+  end
+
+  def test_both_dirt_recorded_once_per_discovery
+    both_setup
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('discussion.txt'), "thread\n")
+    stray = "#{OUT_REL}/00-overview.md"
+    msg = "discovery wrote outside #{OUT_REL}/codex: #{stray}"
+    both_plan('discovery' => { 'write' => ['02-code-review.md'], 'files' => { File.join(@ws, stray) => 'x' } })
+    refute run_topic
+    assert_includes output, msg
+    assert_equal ["#{OUT_REL}/discussion.txt"], usage['discovery_dirty']
+
+    both_plan
+    refute run_topic
+    assert_includes output, "FAILED: phase discovery: #{msg}"
+
+    FileUtils.rm_f(File.join(@ws, stray))
+    assert run_topic, output
+    assert_equal %w[discovery discovery discovery review], calls.map { |c| c['phase'] }
+    refute usage.key?('discovery_dirty')
+  end
+
+  def test_both_replay_discovery_gets_discussion
+    both_setup
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('discussion.txt'), "thread\n")
+    copy = outdir('codex', 'discussion.txt')
+    r = runner(replay: true)
+    seen = []
+    r.define_singleton_method(:run_session) do |rv, phase, prompt, log, usage|
+      seen << [phase.name, File.exist?(copy) && File.read(copy)]
+      super(rv, phase, prompt, log, usage)
+    end
+    ok = nil
+    capture_io { ok = r.run_topic(project: 'p', topic: 't1') }
+    assert ok, output
+    assert_equal [['discovery', "thread\n"], ['review', "thread\n"]], seen
+    assert calls.first['replay_note']
+    assert_includes git('ls-files', "#{OUT_REL}/codex"), "#{OUT_REL}/codex/discussion.txt"
+    assert_equal '', dirty("#{OUT_REL}/codex")
+  end
+
+  def test_both_replay_long_limited_discovery_skips
+    both_setup
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('discussion.txt'), "thread\n")
+    ReviewRun::Pause.for(@state, 'codex').set(NOW + (3 * 86_400), by: 'other')
+    assert run_topic(replay: true, clock: -> { NOW }), output
+    assert_equal [%w[review claude]], phase_agents
+    refute File.exist?(outdir('codex'))
+  end
 end

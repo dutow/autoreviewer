@@ -1,4 +1,5 @@
 require 'open3'
+require 'fileutils'
 require 'json'
 require 'yaml'
 require 'shellwords'
@@ -247,11 +248,12 @@ module ReviewRun
       effort = rv.agents.effort(rv.agent, phase)
       say "=== phase #{phase.name} (#{idx + 1} of #{rv.phases.size}), agent #{rv.agent}, " \
           "model #{rv.agents.model(rv.agent, phase)}#{", effort #{effort}" if effort}"
-      base = discovery_base(usage) if discovery
+      base = discovery_base(rv, usage) if discovery
       started, result, status, reason = run_past_limit(rv, phase, log, usage) do
+        seed_discussion(rv) if discovery && @replay
         Prompt.render(manifest: rv.manifest, phase: phase, ctx: phase_context(rv, phase, idx, usage))
       end
-      stray = discovery_guard(rv, base) if discovery
+      stray = discovery_guard(rv, base, usage.discovery_dirty.to_a) if discovery
       return skip_discovery(rv, phase, usage) if reason == DISCOVERY_SKIP && !stray
 
       reason = stray || reason || phase_failure(rv, phase, result, status)
@@ -473,13 +475,29 @@ module ReviewRun
       true
     end
 
+    # replay: the discussion as of the original review, where discovery looks for it
+    def seed_discussion(rv)
+      src = File.join(@workspace_dir, rv.outdir, 'discussion.txt')
+      dst = File.join(@workspace_dir, discovery_dir(rv), 'discussion.txt')
+      return if !File.file?(src) || File.exist?(dst)
+
+      FileUtils.mkdir_p(File.dirname(dst))
+      FileUtils.cp(src, dst)
+    end
+
     # kept in usage.json until discovery is done, so a resumed discovery still sees
-    # strays committed by an earlier try
-    def discovery_base(usage)
+    # strays committed by an earlier try; so are the paths dirty before the first try
+    def discovery_base(rv, usage)
       base = usage.discovery_base
       if base && !git('cat-file', '-e', "#{base}^{commit}").first
         say "WARNING: discovery base #{base[0, 12]} not in history, guard starts from HEAD"
         base = nil
+      end
+      unless usage.discovery_base
+        dirty = dirty_paths(rv)
+        raise RunError, 'git status failed' unless dirty
+
+        usage.discovery_dirty = outside_discovery(rv, dirty)
       end
       usage.discovery_base = base || head
       usage.write
@@ -488,18 +506,27 @@ module ReviewRun
 
     # runs on every discovery exit: changes under outdir since base (committed, staged, untracked)
     # outside the discovery subdir; no revert, the agent may have committed them
-    def discovery_guard(rv, base)
+    def discovery_guard(rv, base, dirty_before)
       ok, committed = git('diff', '--name-only', '--no-renames', '-z', base, 'HEAD', '--', rv.outdir,
                           stdout_only: true)
-      ok2, status = git('status', '--porcelain', '--no-renames', '-z', '--untracked-files=all', '--', rv.outdir,
-                        stdout_only: true)
-      return 'discovery guard: git failed' unless ok && ok2
+      status = dirty_paths(rv)
+      return 'discovery guard: git failed' unless ok && status
 
+      stray = outside_discovery(rv, committed.split("\0") + status) - dirty_before
+      "discovery wrote outside #{discovery_dir(rv)}: #{stray.join(', ')}" unless stray.empty?
+    end
+
+    # staged, modified or untracked under outdir; false when git fails
+    def dirty_paths(rv)
+      ok, status = git('status', '--porcelain', '--no-renames', '-z', '--untracked-files=all', '--', rv.outdir,
+                       stdout_only: true)
+      ok && status.split("\0").map { |e| e[3..] }
+    end
+
+    def outside_discovery(rv, paths)
       own = "#{discovery_dir(rv)}/"
       exempt = %w[metadata.json usage.json].map { |f| File.join(rv.outdir, f) }
-      paths = committed.split("\0") + status.split("\0").map { |e| e[3..] }
-      stray = paths.uniq.reject { |f| f.start_with?(own) || exempt.include?(f) }
-      "discovery wrote outside #{discovery_dir(rv)}: #{stray.join(', ')}" unless stray.empty?
+      paths.uniq.reject { |f| f.start_with?(own) || exempt.include?(f) }
     end
 
     def head

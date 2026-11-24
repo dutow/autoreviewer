@@ -277,6 +277,20 @@ class UsageTest < Minitest::Test
     end
   end
 
+  def test_discovery_dirty_kept_with_base
+    with_path do |path|
+      u = new_usage(path)
+      u.discovery_base = 'abc123'
+      u.discovery_dirty = ['p/x.txt']
+      u.write
+      assert_equal ['p/x.txt'], new_usage(path).discovery_dirty
+      u.discovery_base = nil
+      u.write
+      refute load_json(path).key?('discovery_dirty')
+      assert_nil new_usage(path).discovery_dirty
+    end
+  end
+
   def test_append_log_writes_jsonl
     Dir.mktmpdir do |d|
       log = File.join(d, 'sub', 'usage.log')

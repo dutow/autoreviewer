@@ -8,6 +8,8 @@ module ReviewRun
 
     # HEAD before the first try of a discovery not done yet
     attr_accessor :discovery_base
+    # version dir paths already dirty then, kept with the base
+    attr_accessor :discovery_dirty
 
     def self.append_log(log_path, entry)
       FileUtils.mkdir_p(File.dirname(log_path))
@@ -37,6 +39,7 @@ module ReviewRun
       @codex_version = nil
       @degraded = false
       @discovery_base = nil
+      @discovery_dirty = nil
       @phases = load(out)
       @changed = false
     end
@@ -97,6 +100,7 @@ module ReviewRun
       h['agent_mode'] = @agent_mode if @agent_mode
       h['degraded'] = true if @degraded
       h['discovery_base'] = @discovery_base if @discovery_base
+      h['discovery_dirty'] = @discovery_dirty if @discovery_base && @discovery_dirty&.any?
       h.merge(
         'phases' => @phases,
         'total' => {
@@ -120,6 +124,7 @@ module ReviewRun
       @codex_version = data['codex_version']
       @degraded = data['degraded'] == true
       @discovery_base = data['discovery_base'] if data['discovery_base'].is_a?(String)
+      @discovery_dirty = data['discovery_dirty'].grep(String) if @discovery_base && data['discovery_dirty'].is_a?(Array)
       phases
     rescue JSON::ParserError, TypeError, NoMethodError, KeyError, SystemCallError => e
       out.puts "WARNING: #{@path} unreadable (#{e.message.lines.first&.strip}), starting fresh"

@@ -264,6 +264,7 @@ Each run gets `replay/<project>/<topic>/vN-<route>-<n>/`:
 - `compare-<label>.md` and `.json` - written by `review-compare`; `<label>` is `reference` for the original review, or the other run's dir name when comparing two replays.
 
 The reference `discussion.txt` is copied into the replay findings dir before the run, and `review-run --replay` tells each phase to use it instead of fetching the thread again, so the replay sees the thread as the original review did.
+With `both`, the runner also copies it into the discovery subdir before discovery.
 
 `review-compare` matches the POST and POST-MINOR points of the replay against the reference: matched, only in the reference, only in the replay, with a one-line reason each.
 It adds both sides' usage totals to the json.
