@@ -241,7 +241,11 @@ class BrowseTest < ActionDispatch::IntegrationTest
     assert_select ".side details.usage", text: /single/
     assert_select ".side details.usage", text: /\$1\.23/
     assert_select ".side details.usage", text: /review opus \$1\.00 ok/
-    assert_select ".side details.usage", text: /validate - \$0\.23 failed/
+    assert_select ".side details.usage", text: /validate codex - \$0\.23 failed/
+    assert_select ".side details.usage", text: /degraded: one agent/
+    assert_select ".side details.usage", text: /agents both/
+    assert_select ".side details.files li.dir", text: /codex\//
+    assert_select ".side details.files a", text: /02-code-review\.md/, minimum: 2
     assert_select ".side details.files a", { text: /usage\.json/, count: 0 }
 
     get "/p/alpha/t/t1/v/1/f/00-overview.md"

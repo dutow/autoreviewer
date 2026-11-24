@@ -30,12 +30,16 @@
           - total = usage["total"].is_a?(Hash) ? usage["total"] : {}
           - if usage["route"]
             li = "route #{usage["route"]}"
+          - if usage["agent_mode"]
+            li = "agents #{usage["agent_mode"]}"
+          - if usage["degraded"]
+            li = "degraded: one agent"
           - if total["cost_usd"].is_a?(Numeric)
             li = "total #{format("$%.2f", total["cost_usd"])}"
           - if total["tokens"].is_a?(Hash)
             li = "#{number_with_delimiter(total["tokens"].values.grep(Integer).sum)} tokens"
           - Array(usage["phases"]).grep(Hash).each do |ph|
-            li.phase = "#{ph["phase"]} #{ph["model"] || "-"} #{ph["cost_usd"].is_a?(Numeric) ? format("$%.2f", ph["cost_usd"]) : "-"} #{ph["status"]}"
+            li.phase = "#{ph["phase"]} #{ph["agent"] ? ph["agent"] + " " : ""}#{ph["model"] || "-"} #{ph["cost_usd"].is_a?(Numeric) ? format("$%.2f", ph["cost_usd"]) : "-"} #{ph["status"]}"
     details.versions[open data-key="versions"]
       summary Versions
       ul
