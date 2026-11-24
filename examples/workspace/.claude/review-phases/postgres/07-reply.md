@@ -20,7 +20,7 @@ Content rules:
 - Skip findings that `04-mailing-list-status.md` marks FIXED.
   KNOWN or UNDER_DISCUSSION findings only get a short note, and only if our validation adds something (a reproducer, a confirmation, a disagreement).
 - Write in first person singular ("I"), as the reviewer.
-  Say in one sentence that the issues came from an automated claude review (e.g. "An automated claude review pointed out ..."), but never mention agents, phases, severity labels, POST/FYI, or the findings files.
+  Say in one sentence that the issues came from an automated review (e.g. "An automated review pointed out ..." or "A coding agent assisted review found ..."), but never name the agent or model, and never mention agents, phases, severity labels, POST/FYI, or the findings files.
 - For each bug: what goes wrong, the concrete scenario or reproducer (short SQL / commands, inline, not as an attachment reference), the actual vs expected result, and the suggested fix if we have a confident one.
   Quote the relevant patch hunk (a few lines, as plain diff) when it makes the location clear.
   Do not overstate confidence: a LIKELY_BUG is written as a question or "I think", per the style guide.
@@ -29,7 +29,7 @@ Content rules:
 - Greeting "Hello" (no comma), no sign-off.
 - Keep it short: the reproducer and the mechanism, not a narrative.
 
-Write `postgres/findings/$ARGUMENTS/v{version}/06-reply-draft.md`:
+Write `$OUTDIR/06-reply-draft.md`:
 
 ```
 # Draft reply: $ARGUMENTS v{version}
@@ -42,7 +42,7 @@ Subject: Re: <thread subject>
 <email body>
 ```
 
-Commit: `git add postgres/findings/$ARGUMENTS/ && git commit -m "review($ARGUMENTS): add mailing list reply draft"`
+Commit: `git add $OUTDIR/ && git commit -m "review($ARGUMENTS): add mailing list reply draft"`
 
 ---
 

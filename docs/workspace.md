@@ -25,7 +25,8 @@ At the workspace root:
 - `Taskfile.yml` - optional per-project task helpers (e.g. the postgres cluster start/stop/psql tasks).
 - `.claude/commands/` - review slash commands, per project, plus the `_git-pr` spine template and `_template` skeleton.
 - `.claude/review-phases/<name>/` - per-project phase manifest (`phases.yaml`), `shared.md` and numbered phase prompts for the review runner, plus the `_git-pr` and `_template` copies (see [adding-a-project.md](adding-a-project.md#review-phases)).
-- `CLAUDE.md` - identity and layout notes for claude sessions run in this workspace (see below).
+- `AGENTS.md` - identity and layout notes for agent sessions run in this workspace (see below).
+- `CLAUDE.md` - one line, `@AGENTS.md`, so claude reads the same notes.
 - `Dockerfile` - optional, adds project build deps to the queue image (see below).
 - `bin/` - workspace-shared hooks and vendored tools.
 - `public/` - optional, static files the webapp serves as-is at `/public/` (see [setup.md](setup.md#static-files)).
@@ -85,11 +86,12 @@ USER reviewer
 Enable it with `QUEUE_DOCKERFILE=workspace/Dockerfile` in `.env`, then `task build`.
 See `examples/workspace/Dockerfile` for the Postgres/meson build-dependency list used by the reference projects.
 
-## CLAUDE.md identity block
+## AGENTS.md identity block
 
-`CLAUDE.md` at the workspace root is read by every claude session run in the workspace (interactive `task claude` and every phase session of a queued review alike).
+`AGENTS.md` at the workspace root is read by every agent session run in the workspace (interactive `task claude` and every phase session of a queued review alike).
+`CLAUDE.md` contains only `@AGENTS.md`, so claude and codex see the same text.
 Fill in the identity block at the top: who you are, which forge/mailing-list identity the reviews feed under, and any per-community conventions worth the agent knowing up front.
-See `examples/workspace/CLAUDE.md` for the placeholder and the rest of the layout notes it documents.
+See `examples/workspace/AGENTS.md` for the placeholder and the rest of the layout notes it documents.
 
 ## Migrating a pre-split workspace
 
