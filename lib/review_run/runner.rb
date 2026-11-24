@@ -247,13 +247,14 @@ module ReviewRun
       effort = rv.agents.effort(rv.agent, phase)
       say "=== phase #{phase.name} (#{idx + 1} of #{rv.phases.size}), agent #{rv.agent}, " \
           "model #{rv.agents.model(rv.agent, phase)}#{", effort #{effort}" if effort}"
-      before = head if discovery
+      base = discovery_base(usage) if discovery
       started, result, status, reason = run_past_limit(rv, phase, log, usage) do
         Prompt.render(manifest: rv.manifest, phase: phase, ctx: phase_context(rv, phase, idx, usage))
       end
-      return skip_discovery(rv, phase, usage) if reason == DISCOVERY_SKIP
+      stray = discovery_guard(rv, base) if discovery
+      return skip_discovery(rv, phase, usage) if reason == DISCOVERY_SKIP && !stray
 
-      reason ||= phase_failure(rv, phase, result, status, before)
+      reason = stray || reason || phase_failure(rv, phase, result, status)
       log_usage(rv, phase, reason ? 'failed' : 'ok', result)
       if reason
         usage.fail(phase: phase.name, reason: reason, result: result, started_at: started, agent: rv.agent)
@@ -261,22 +262,19 @@ module ReviewRun
         fail_review(rv.project, rv.topic, "phase #{phase.name}: #{reason}")
         return false
       end
+      usage.discovery_base = nil if discovery
       usage.add(phase: phase.name, model: rv.agents.model(rv.agent, phase), result: result, started_at: started,
                 agent: rv.agent)
       usage.write
       true
     end
 
-    # before: HEAD before a discovery session, for the guard
-    def phase_failure(rv, phase, result, status, before = nil)
+    def phase_failure(rv, phase, result, status)
       reason = session_failure(rv.agent, result, status)
       return reason if reason || !phase.output
 
       file = File.join(rv.outdir, phase.output)
       return "output #{file} missing" unless File.exist?(File.join(@workspace_dir, file))
-
-      stray = before && discovery_guard(rv, before)
-      return stray if stray
 
       commit_output(rv, phase) ? nil : "could not commit #{file}"
     end
@@ -293,7 +291,7 @@ module ReviewRun
       hits = 0
       notified = false
       loop do
-        return [nil, nil, nil, DISCOVERY_SKIP] unless both_pick(rv, phase, usage)
+        return [@clock.call, nil, nil, DISCOVERY_SKIP] unless both_pick(rv, phase, usage)
 
         pause = @pauses[rv.agent]
         started = @clock.call
@@ -469,15 +467,29 @@ module ReviewRun
       t = @pauses[rv.agent].until_time
       say "#{rv.agent} long-limited#{" until #{fmt_time(t)}" if t}, discovery skipped"
       usage.skip(phase: phase.name, agent: rv.agent, reason: DISCOVERY_SKIP, started_at: @clock.call)
+      usage.discovery_base = nil
       usage.degraded!
       usage.write
       true
     end
 
-    # changes under outdir since before (committed, staged, untracked) outside the discovery subdir;
-    # no revert, the agent may have committed them
-    def discovery_guard(rv, before)
-      ok, committed = git('diff', '--name-only', '--no-renames', '-z', before, 'HEAD', '--', rv.outdir)
+    # kept in usage.json until discovery is done, so a resumed discovery still sees
+    # strays committed by an earlier try
+    def discovery_base(usage)
+      base = usage.discovery_base
+      if base && !git('cat-file', '-e', "#{base}^{commit}").first
+        say "WARNING: discovery base #{base[0, 12]} not in history, guard starts from HEAD"
+        base = nil
+      end
+      usage.discovery_base = base || head
+      usage.write
+      usage.discovery_base
+    end
+
+    # runs on every discovery exit: changes under outdir since base (committed, staged, untracked)
+    # outside the discovery subdir; no revert, the agent may have committed them
+    def discovery_guard(rv, base)
+      ok, committed = git('diff', '--name-only', '--no-renames', '-z', base, 'HEAD', '--', rv.outdir)
       ok2, status = git('status', '--porcelain', '--no-renames', '-z', '--untracked-files=all', '--', rv.outdir)
       return 'discovery guard: git failed' unless ok && ok2
 

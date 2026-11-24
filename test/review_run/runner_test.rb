@@ -925,6 +925,7 @@ class RunnerTest < Minitest::Test
     assert_equal [%w[discovery codex ok gpt-6.2-astra], %w[review claude ok opus]], usage_rows('model')
     assert_equal 'both', u['agent_mode']
     refute u.key?('degraded')
+    refute u.key?('discovery_base')
     assert_equal %w[01-discovery.jsonl 02-review.jsonl], Dir.children(File.join(@state, 'logs', 'p-t1-v2')).sort
     assert_includes output, 'agent claude (both, discovery on codex)'
     assert_includes output, '=== phase discovery (1 of 2), agent codex'
@@ -1001,10 +1002,16 @@ class RunnerTest < Minitest::Test
     assert_equal [['discovery', 'codex', 'skipped', 'usage limit (long)'], ['review', 'claude', 'ok', nil]],
                  usage_rows('reason')
     assert_equal true, usage['degraded']
+    refute usage.key?('discovery_base')
+  end
 
-    reset_run
+  def test_both_resume_after_skipped_discovery
+    both_setup
+    ReviewRun::Pause.for(@state, 'codex').set(NOW + (3 * 86_400), by: 'other')
     both_plan('review' => { 'write' => ['05-summary.md'], 'exit' => 1 })
     refute run_topic(clock: -> { NOW })
+    assert_equal [%w[discovery codex skipped], %w[review claude failed]], usage_rows
+
     ReviewRun::Pause.for(@state, 'codex').clear
     FileUtils.mkdir_p(outdir('codex'))
     File.write(outdir('codex', '02-code-review.md'), "partial\n")
@@ -1014,6 +1021,72 @@ class RunnerTest < Minitest::Test
     assert_includes output, 'skip discovery: skipped earlier'
     refute calls.last['note']
     assert_equal true, usage['degraded']
+  end
+
+  def test_both_stray_of_failed_discovery_never_accepted
+    both_setup
+    stray = "#{OUT_REL}/05-summary.md"
+    msg = "discovery wrote outside #{OUT_REL}/codex: #{stray}"
+    both_plan('discovery' => { 'write' => [], 'files' => { File.join(@ws, stray) => 'codex summary' },
+                               'commit_files' => true })
+    refute run_topic
+    assert_includes output, "FAILED: phase discovery: #{msg}"
+    assert_equal [['discovery', 'codex', 'failed', msg]], usage_rows('reason')
+    assert usage['discovery_base']
+
+    both_plan
+    refute run_topic
+    assert_includes output, "FAILED: phase discovery: #{msg}"
+    refute_includes output, 'skip review'
+    assert_equal %w[discovery discovery], calls.map { |c| c['phase'] }
+
+    git('rm', '-q', stray)
+    git('commit', '-q', '-m', 'drop stray')
+    assert run_topic, output
+    assert_equal [%w[discovery codex]] * 3 + [%w[review claude]], phase_agents
+    refute usage.key?('discovery_base')
+  end
+
+  def test_both_guard_runs_on_session_failure
+    both_setup
+    stray = "#{OUT_REL}/00-overview.md"
+    both_plan('discovery' => { 'write' => ['02-code-review.md'], 'exit' => 1,
+                               'files' => { File.join(@ws, stray) => 'x' } })
+    refute run_topic
+    msg = "discovery wrote outside #{OUT_REL}/codex: #{stray}"
+    assert_includes output, "FAILED: phase discovery: #{msg}"
+    assert_equal [['discovery', 'codex', 'failed', msg]], usage_rows('reason')
+  end
+
+  def test_both_guard_runs_before_long_skip
+    both_setup
+    base = git('rev-parse', 'HEAD').strip
+    stray = "#{OUT_REL}/05-summary.md"
+    FileUtils.mkdir_p(outdir)
+    File.write(File.join(@ws, stray), "codex summary\n")
+    git('add', stray)
+    git('commit', '-q', '-m', 'stray of a killed discovery')
+    File.write(outdir('usage.json'), JSON.generate('discovery_base' => base, 'phases' => [
+                                                     { 'phase' => 'discovery', 'agent' => 'codex', 'status' => 'limit',
+                                                       'cost_usd' => nil, 'duration_ms' => 1 }
+                                                   ]))
+    ReviewRun::Pause.for(@state, 'codex').set(NOW + (3 * 86_400), by: 'other')
+    refute run_topic(clock: -> { NOW })
+    assert_empty calls
+    assert_includes output, "FAILED: phase discovery: discovery wrote outside #{OUT_REL}/codex: #{stray}"
+    refute_includes output, 'discovery skipped'
+    assert_equal %w[limit failed], usage['phases'].map { |p| p['status'] }
+    refute usage.key?('degraded')
+  end
+
+  def test_both_base_gone_from_history_starts_over
+    both_setup
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('usage.json'), JSON.generate('discovery_base' => 'f' * 40, 'phases' => []))
+    assert run_topic, output
+    assert_includes output, 'WARNING: discovery base ffffffffffff not in history, guard starts from HEAD'
+    assert_equal %w[discovery review], calls.map { |c| c['phase'] }
+    refute usage.key?('discovery_base')
   end
 
   def test_both_discovery_long_limit_hit_skips

@@ -6,6 +6,9 @@ module ReviewRun
   class Usage
     TOKEN_KEYS = %w[input output cache_read cache_write].freeze
 
+    # HEAD before the first try of a discovery not done yet
+    attr_accessor :discovery_base
+
     def self.append_log(log_path, entry)
       FileUtils.mkdir_p(File.dirname(log_path))
       File.open(log_path, 'a') { |f| f.puts(JSON.generate(entry)) }
@@ -33,6 +36,7 @@ module ReviewRun
       @agent_mode = agent_mode
       @codex_version = nil
       @degraded = false
+      @discovery_base = nil
       @phases = load(out)
       @changed = false
     end
@@ -92,6 +96,7 @@ module ReviewRun
       h['codex_version'] = @codex_version if @codex_version
       h['agent_mode'] = @agent_mode if @agent_mode
       h['degraded'] = true if @degraded
+      h['discovery_base'] = @discovery_base if @discovery_base
       h.merge(
         'phases' => @phases,
         'total' => {
@@ -114,6 +119,7 @@ module ReviewRun
       @agent_mode ||= data['agent_mode']
       @codex_version = data['codex_version']
       @degraded = data['degraded'] == true
+      @discovery_base = data['discovery_base'] if data['discovery_base'].is_a?(String)
       phases
     rescue JSON::ParserError, TypeError, NoMethodError, KeyError, SystemCallError => e
       out.puts "WARNING: #{@path} unreadable (#{e.message.lines.first&.strip}), starting fresh"

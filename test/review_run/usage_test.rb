@@ -260,7 +260,20 @@ class UsageTest < Minitest::Test
     with_path do |path|
       new_usage(path).write
       d = load_json(path)
-      %w[agent_mode codex_version degraded].each { |k| refute d.key?(k), k }
+      %w[agent_mode codex_version degraded discovery_base].each { |k| refute d.key?(k), k }
+    end
+  end
+
+  def test_discovery_base_survives_reload
+    with_path do |path|
+      u = new_usage(path)
+      u.discovery_base = 'abc123'
+      u.write
+      assert_equal 'abc123', new_usage(path).discovery_base
+      u.discovery_base = nil
+      u.write
+      refute load_json(path).key?('discovery_base')
+      assert_nil new_usage(path).discovery_base
     end
   end
 
