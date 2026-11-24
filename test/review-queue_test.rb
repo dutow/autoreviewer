@@ -153,11 +153,11 @@ class ReviewQueuePauseTest < Minitest::Test
 end
 
 class ReviewQueuePreflightTest < Minitest::Test
-  ENV_KEYS = %w[STATE_DIR WORKSPACE_DIR CODEX_HOME OPENAI_API_KEY CODEX_API_KEY].freeze
+  ENV_KEYS = %w[STATE_DIR WORKSPACE_DIR CODEX_HOME OPENAI_API_KEY CODEX_API_KEY PATH].freeze
 
   def setup
     @saved_env = ENV_KEYS.to_h { |k| [k, ENV[k]] }
-    ENV_KEYS.each { |k| ENV.delete(k) }
+    ENV_KEYS.each { |k| ENV.delete(k) unless k == 'PATH' }
     @dir = Dir.mktmpdir
     @ws = File.join(@dir, 'ws')
     ENV['STATE_DIR'] = File.join(@dir, 'state')
@@ -187,6 +187,37 @@ class ReviewQueuePreflightTest < Minitest::Test
     out = run_preflight
     refute @result
     assert_includes out, "FAIL codex authenticated: codex CLI missing or not logged in - run 'task codex-login'"
+  end
+
+  def with_fake_codex
+    bin = File.join(@dir, 'bin')
+    FileUtils.mkdir_p(bin)
+    File.write(File.join(bin, 'codex'), "#!/bin/sh\nexit 0\n")
+    File.chmod(0o755, File.join(bin, 'codex'))
+    ENV['PATH'] = "#{bin}:#{ENV['PATH']}"
+  end
+
+  def test_codex_auth_file_passes
+    project('p', "review:\n  agent: codex\n")
+    with_fake_codex
+    FileUtils.mkdir_p(ENV['CODEX_HOME'])
+    File.write(File.join(ENV['CODEX_HOME'], 'auth.json'), '{}')
+    assert_match(/^OK   codex authenticated$/, run_preflight)
+  end
+
+  %w[OPENAI_API_KEY CODEX_API_KEY].each do |key|
+    define_method("test_codex_#{key.downcase}_passes") do
+      project('p', "review:\n  agent: codex\n")
+      with_fake_codex
+      ENV[key] = 'k'
+      assert_match(/^OK   codex authenticated$/, run_preflight)
+    end
+  end
+
+  def test_codex_installed_without_auth_fails
+    project('p', "review:\n  agent: codex\n")
+    with_fake_codex
+    assert_match(/^FAIL codex authenticated: /, run_preflight)
   end
 
   def test_all_claude_has_no_codex_check
