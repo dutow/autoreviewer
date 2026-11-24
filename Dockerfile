@@ -33,6 +33,10 @@ RUN sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -b /usr/local/bin
 RUN npm install -g --no-fund --no-audit @anthropic-ai/claude-code \
  && npm cache clean --force
 
+# codex CLI
+RUN npm install -g --no-fund --no-audit @openai/codex \
+ && npm cache clean --force
+
 # default git identity so 'git am' and findings commits never fail on a fresh
 # home volume. --system writes /etc/gitconfig, outside the mounted home dir, so
 # it survives. GIT_{AUTHOR,COMMITTER}_* env vars from .env override it.

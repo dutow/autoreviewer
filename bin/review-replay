@@ -2,11 +2,12 @@
 # frozen_string_literal: true
 
 # Re-run a reviewed version through a route in a throwaway clone of the workspace.
-#   review-replay [--keep-worktree] <project> <topic> <vN> <route>
+#   review-replay [--keep-worktree] [--agent NAME] <project> <topic> <vN> <route>
 # Needs the live review/<topic> still at vN. Output: replay/<project>/<topic>/vN-<route>-<n>/
 
 require 'optparse'
 require_relative '../lib/review_replay/workspace'
+require_relative '../lib/review_run/agents'
 
 $stdout.sync = true
 
@@ -18,8 +19,9 @@ end
 base_dir = File.expand_path('..', __dir__)
 opts = {}
 parser = OptionParser.new do |o|
-  o.banner = 'usage: review-replay [--keep-worktree] <project> <topic> <vN> <route>'
+  o.banner = 'usage: review-replay [--keep-worktree] [--agent NAME] <project> <topic> <vN> <route>'
   o.on('--keep-worktree', 'leave the review worktree in place') { opts[:keep] = true }
+  o.on('--agent NAME', ReviewRun::Agents::NAMES, "run every phase on NAME (#{ReviewRun::Agents::NAMES.join(', ')})") { |v| opts[:agent] = v }
 end
 
 begin
@@ -34,7 +36,7 @@ project, topic, version, route = args
 begin
   wsp = ReviewReplay::Workspace.new(workspace_dir: env_or('WORKSPACE_DIR', File.join(base_dir, 'workspace')),
                                     replay_root: env_or('REPLAY_DIR', File.join(base_dir, 'replay')))
-  run = wsp.prepare(project: project, topic: topic, version: version, route: route)
+  run = wsp.prepare(project: project, topic: topic, version: version, route: route, agent: opts[:agent])
 rescue ReviewReplay::ReplayError => e
   warn "ERROR: #{e.message}"
   exit 1
@@ -47,7 +49,9 @@ puts "=== replay #{project}/#{topic} v#{run.version}, route #{route} in #{run.di
 ok = false
 meta = {}
 begin
-  cmd = [File.join(base_dir, 'bin', 'review-run'), '--replay', '--route', route, project, topic]
+  cmd = [File.join(base_dir, 'bin', 'review-run'), '--replay', '--route', route]
+  cmd += ['--agent', opts[:agent]] if opts[:agent]
+  cmd += [project, topic]
   ok = system({ 'WORKSPACE_DIR' => run.ws, 'STATE_DIR' => run.state }, *cmd, chdir: run.ws) || false
 rescue Interrupt
   warn 'Interrupted'

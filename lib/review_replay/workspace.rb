@@ -8,7 +8,7 @@ module ReviewReplay
   class ReplayError < StandardError; end
 
   Run = Struct.new(:project, :topic, :version, :route, :dir, :ws, :state, :reference, :head,
-                   :live_master, :worktree, keyword_init: true)
+                   :live_master, :worktree, :agent, keyword_init: true)
 
   # throwaway copy of the live workspace for re-running one reviewed version
   class Workspace
@@ -23,8 +23,9 @@ module ReviewReplay
       raise ReplayError, "workspace not found: #{workspace_dir}"
     end
 
-    def prepare(project:, topic:, version:, route:)
+    def prepare(project:, topic:, version:, route:, agent: nil)
       run = check(project, topic, parse_version(version), route)
+      run.agent = agent
       begin
         claim_dir(run)
         clone(run)
@@ -194,7 +195,7 @@ module ReviewReplay
     def write_meta(run)
       FileUtils.mkdir_p(run.state)
       File.symlink(File.join('ws', run.project, 'findings', run.topic, "v#{run.version}"), File.join(run.dir, 'findings'))
-      meta = { 'project' => run.project, 'topic' => run.topic, 'version' => run.version, 'route' => run.route,
+      meta = { 'project' => run.project, 'topic' => run.topic, 'version' => run.version, 'route' => run.route, 'agent' => run.agent,
                'reference' => run.reference, 'head' => run.head, 'created_at' => Time.now.utc.iso8601 }
       File.write(File.join(run.dir, 'replay.json'), "#{JSON.pretty_generate(meta)}\n")
     end

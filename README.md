@@ -32,6 +32,7 @@ task init-workspace          # or: git clone <your workspace repo> workspace
 task setup                   # creates .env; defaults are fine for localhost
 task build
 task login                   # claude auth, one time
+task codex-login             # only for projects using codex
 task up
 task enqueue -- pg_tde 123   # review PR 123
 task attach                  # watch it work; Ctrl-b d to detach

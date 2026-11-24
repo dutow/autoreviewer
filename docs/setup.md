@@ -48,6 +48,8 @@ task login
 ```
 
 Runs `claude /login` inside the container, interactively.
+For projects using codex, also run `task codex-login` (device code login, stored in the same volume).
+Set `review.agent` in a project only after `task build` and `task codex-login`.
 Auth is stored in the `home` docker volume (`/home/reviewer`), so it survives image rebuilds and `task down` / `task up` cycles.
 
 Changing `UID` in `.env` after your first `task build` means the container user's home directory changes ownership expectations; if login stops working after a uid change, remove the `home` volume and log in again.
@@ -239,12 +241,12 @@ It is how a route is checked before a project switches to it: replay a few revie
 Replaying some of the same topics on `single` again shows how much two runs differ on their own.
 
 ```
-task replay -- <project> <topic> <vN> <route>    # tmux window "replay", watch with task attach
+task replay -- [--agent NAME] <project> <topic> <vN> <route>    # tmux window "replay", watch with task attach
 task compare -- <run dir> <reference dir>         # one Opus session, a few minutes
 task compare -- --table                           # one line per compare
 ```
 
-Inside the container the same commands are `bin/review-replay [--keep-worktree] <project> <topic> <vN> <route>` and `bin/review-compare`, run from the repo root.
+Inside the container the same commands are `bin/review-replay [--keep-worktree] [--agent NAME] <project> <topic> <vN> <route>` and `bin/review-compare`, run from the repo root.
 `review-replay` prints the run dir and the `review-compare` command line for it when it ends.
 
 A replay needs the live `review/<topic>` still at vN (`metadata.json` version N), and reuses that ingest and build.
@@ -258,7 +260,7 @@ Each run gets `replay/<project>/<topic>/vN-<route>-<n>/`:
   Phase commits land in this clone only.
 - `findings` - link to the replayed findings dir in `ws/`.
 - `state/` - the runner's state dir (logs, `usage.log`, pause file), separate from the queue's.
-- `replay.json` - project, topic, version, route, reference dir, review HEAD, start and end time, `ok`, `inputs_changed`, `cost_usd`.
+- `replay.json` - project, topic, version, route, forced agent, reference dir, review HEAD, start and end time, `ok`, `inputs_changed`, `cost_usd`.
 - `compare-<label>.md` and `.json` - written by `review-compare`; `<label>` is `reference` for the original review, or the other run's dir name when comparing two replays.
 
 The reference `discussion.txt` is copied into the replay findings dir before the run, and `review-run --replay` tells each phase to use it instead of fetching the thread again, so the replay sees the thread as the original review did.

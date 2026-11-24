@@ -91,6 +91,12 @@ class CompareTest < Minitest::Test
                   { 'phase' => 'ph1', 'model' => 'opus', 'status' => 'ok', 'cost_usd' => 2.0 }], t['phases']
   end
 
+  def test_usage_totals_cost_nil_without_numeric_cost
+    run = make_run('v2-full-2', usage: [nil, nil])
+    t = ReviewReplay::Compare.usage_totals(ReviewReplay::Compare.resolve(run).findings_dir)
+    assert_nil t['cost_usd']
+  end
+
   def test_usage_totals_nil_without_usage
     assert_nil ReviewReplay::Compare.usage_totals(@ref)
   end
