@@ -62,6 +62,45 @@ class PromptTest < Minitest::Test
     end
   end
 
+  def test_note_nil_leaves_header_unchanged
+    with_setup do |m, ph|
+      a = ReviewRun::Prompt.render(manifest: m, phase: ph, ctx: ctx)
+      b = ReviewRun::Prompt.render(manifest: m, phase: ph, ctx: ctx(note: nil))
+      assert_equal a, b
+      assert_includes a, "(the current directory).\n\nbody t1"
+    end
+  end
+
+  def test_note_after_header_lines
+    with_setup do |m, ph|
+      out = ReviewRun::Prompt.render(manifest: m, phase: ph, ctx: ctx(note: ReviewRun::Prompt::DISCOVERY_NOTE))
+      assert_includes out, "(the current directory).\n\n#{ReviewRun::Prompt::DISCOVERY_NOTE}\n\nbody t1"
+      assert_equal 1, out.scan(ReviewRun::Prompt::DISCOVERY_NOTE).size
+    end
+  end
+
+  def test_note_after_replay_note
+    with_setup do |m, ph|
+      out = ReviewRun::Prompt.render(manifest: m, phase: ph, ctx: ctx(replay: true, note: 'N'))
+      assert_includes out, "#{ReviewRun::Prompt::REPLAY_NOTE}\n\nN\n\nbody t1"
+    end
+  end
+
+  def test_outdir_subdirectory
+    with_setup do |m, ph|
+      out = ReviewRun::Prompt.render(manifest: m, phase: ph, ctx: ctx(outdir: 'p/findings/t1/v2/codex'))
+      assert_includes out, "Output directory: p/findings/t1/v2/codex\n"
+      assert_includes out, "body t1 p/findings/t1/v2/codex postgres\n"
+    end
+  end
+
+  def test_primary_note
+    note = ReviewRun::Prompt.primary_note('p/findings/t1/v2/codex')
+    assert_includes note, '`p/findings/t1/v2/codex/01-design-review.md` and `p/findings/t1/v2/codex/02-code-review.md`'
+    assert_includes note, 'Do not read anything under `p/findings/t1/v2/codex/` until'
+    assert_includes note, 'Do not modify files under `p/findings/t1/v2/codex/`.'
+  end
+
   def test_prev_dir_shown
     with_setup do |m, ph|
       out = ReviewRun::Prompt.render(manifest: m, phase: ph, ctx: ctx(prev_dir: 'postgres/findings/t1/v2'))
