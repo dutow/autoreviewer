@@ -246,10 +246,24 @@ class BrowseTest < ActionDispatch::IntegrationTest
     assert_select ".side details.usage", text: /agents both/
     assert_select ".side details.files li.dir", text: /codex\//
     assert_select ".side details.files a", text: /02-code-review\.md/, minimum: 2
+    get "/"
+    t1 = css_select("table.reviews tbody tr").find { |tr| tr.text.include?("t1") }
+    assert_includes t1.text, "1 BUG"
+    assert_includes t1.text, "2 SUSP"
+    get "/p/alpha/t/t1/v/2/f/00-overview.md"
     assert_select ".side details.files a", { text: /usage\.json/, count: 0 }
 
     get "/p/alpha/t/t1/v/1/f/00-overview.md"
     assert_select ".side details.usage", count: 0
+  end
+
+  test "non-string agent in usage still renders" do
+    ReviewsFixture.commit_change(@reviews_dir, "alpha/findings/t1/v1/usage.json", '{"route":"single","phases":[{"phase":"review","agent":{"x":1},"model":"opus","cost_usd":1,"status":"ok"},{"phase":"v","agent":7,"status":"ok"}]}')
+    Indexer.new(root: ReviewsRoot.new(path: @reviews_dir)).run
+    get "/p/alpha/t/t1/v/1/f/00-overview.md"
+    assert_response :success
+    assert_select ".side details.usage li.phase", count: 2
+    assert_select ".side details.usage", text: /review opus \$1\.00 ok/
   end
 
 test "dotted project and topic names route" do

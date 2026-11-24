@@ -39,7 +39,7 @@
           - if total["tokens"].is_a?(Hash)
             li = "#{number_with_delimiter(total["tokens"].values.grep(Integer).sum)} tokens"
           - Array(usage["phases"]).grep(Hash).each do |ph|
-            li.phase = "#{ph["phase"]} #{ph["agent"] ? ph["agent"] + " " : ""}#{ph["model"] || "-"} #{ph["cost_usd"].is_a?(Numeric) ? format("$%.2f", ph["cost_usd"]) : "-"} #{ph["status"]}"
+            li.phase = "#{ph["phase"]} #{ph["agent"].is_a?(String) ? "#{ph["agent"]} " : ""}#{ph["model"] || "-"} #{ph["cost_usd"].is_a?(Numeric) ? format("$%.2f", ph["cost_usd"]) : "-"} #{ph["status"]}"
     details.versions[open data-key="versions"]
       summary Versions
       ul
