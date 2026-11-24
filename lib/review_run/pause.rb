@@ -5,8 +5,26 @@ require 'time'
 module ReviewRun
   # usage-limit pause flag shared by runners and the queue: {"until": iso8601, "by": window}
   class Pause
+    LONG = 12 * 3600
+
+    attr_reader :path
+
+    def self.for(state_dir, agent)
+      new(File.join(state_dir, agent == 'codex' ? 'paused-codex' : 'paused'))
+    end
+
     def initialize(path)
       @path = path
+    end
+
+    def long?(now)
+      active?(now) && until_time - now > LONG
+    end
+
+    def state(now)
+      return :none unless active?(now)
+
+      long?(now) ? :long : :short
     end
 
     def set(until_time, by:)
