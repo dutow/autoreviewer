@@ -65,7 +65,7 @@ The phases.yaml models are claude names.
 However discovery ends (done, failed, or skipped on a long limit), the runner checks the version dir: a change outside `<secondary>/` (committed since the first discovery try started, staged or untracked) fails the review, naming the files.
 `metadata.json`, `usage.json` and the paths already uncommitted when the first try started are exempt, and nothing is reverted.
 The commit before the first try stays in `usage.json` as `discovery_base` until discovery is done, with those paths as `discovery_dirty`, so a resumed discovery still catches what an earlier try wrote; remove or revert those files and commit before rerunning.
-A resumed review does not rerun a finished or skipped discovery.
+A resumed review does not rerun a finished or skipped discovery, and a review whose route phase is already done runs no discovery (unless an earlier discovery try is pending, so its check still runs).
 `--agent` (below) runs a plain one-agent review, with no discovery.
 
 A usage limit is short when its reset is within 12 hours, long when it is further out:
@@ -78,7 +78,7 @@ A usage limit is short when its reset is within 12 hours, long when it is furthe
 
 `both` on a long limit:
 
-- secondary long-limited, before or during discovery: discovery is skipped, the primary reviews alone with no discovery note.
+- secondary long-limited, before or during discovery: discovery is skipped, the primary reviews alone with no discovery note; what a cut-short discovery wrote in the subdir is committed as the record.
 - primary long-limited: the other agent runs the review phase alone, with no discovery note; its discovery output stays in the subdir.
 - both long-limited: the runner waits for the earlier reset and goes on with that agent.
 

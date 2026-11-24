@@ -75,7 +75,7 @@ module ReviewRun
           "#{agent_desc(rv)}"
 
       rv.phases.each_with_index do |phase, idx|
-        if (why = skip_reason(phase, outdir_abs, usage))
+        if (why = skip_reason(rv, phase, outdir_abs, usage))
           say "skip #{phase.name}: #{why}"
           next if commit_output(rv, phase)
 
@@ -220,8 +220,12 @@ module ReviewRun
                   prev_dir: rv.prev_dir, index: idx + 1, total: rv.phases.size, replay: @replay)
     end
 
-    # resume: phase skipped before, or output present and last run of the phase was not cut short
-    def skip_reason(phase, outdir_abs, usage)
+    # resume: phase skipped before, or output present and last run of the phase was not cut short;
+    # discovery also when the route phase is done, unless a discovery try is pending: its guard must run
+    def skip_reason(rv, phase, outdir_abs, usage)
+      if discovery?(rv, phase) && !usage.discovery_base && (why = skip_reason(rv, rv.phases.last, outdir_abs, usage))
+        return "#{rv.phases.last.name}: #{why}"
+      end
       return 'skipped earlier' if usage.last_status(phase.name) == 'skipped'
 
       if phase.output && File.exist?(File.join(outdir_abs, phase.output)) &&
@@ -472,7 +476,9 @@ module ReviewRun
       usage.discovery_base = nil
       usage.degraded!
       usage.write
-      true
+      return true if commit_output(rv, phase)
+
+      fail_review(rv.project, rv.topic, "could not commit #{discovery_dir(rv)}")
     end
 
     # replay: the discussion as of the original review, where discovery looks for it

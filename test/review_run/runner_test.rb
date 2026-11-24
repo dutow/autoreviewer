@@ -1265,4 +1265,38 @@ class RunnerTest < Minitest::Test
     assert_equal [%w[review claude]], phase_agents
     refute File.exist?(outdir('codex'))
   end
+
+  def test_both_skipped_discovery_commits_subdir
+    both_setup
+    both_plan('discovery' => { 'write' => ['02-code-review.md'], 'limit_times' => 1,
+                               'limit_text' => "You've hit your usage limit. Try again in 3 days." })
+    partial = outdir('codex', '00-overview.md')
+    r = runner(clock: -> { NOW })
+    r.define_singleton_method(:run_session) do |rv, phase, prompt, log, usage|
+      if phase.name == 'discovery'
+        FileUtils.mkdir_p(File.dirname(partial))
+        File.write(partial, "partial\n")
+      end
+      super(rv, phase, prompt, log, usage)
+    end
+    ok = nil
+    capture_io { ok = r.run_topic(project: 'p', topic: 't1') }
+    assert ok, output
+    assert_equal [%w[discovery codex limit], %w[discovery codex skipped], %w[review claude ok]], usage_rows
+    assert_equal "#{OUT_REL}/codex/00-overview.md\n", git('ls-files', "#{OUT_REL}/codex")
+    assert_equal '', dirty('p/findings')
+  end
+
+  def test_both_skips_discovery_when_review_done
+    both_setup
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('05-summary.md'), "done\n")
+    git('add', "#{OUT_REL}/05-summary.md")
+    git('commit', '-q', '-m', 'finished')
+    assert run_topic, output
+    assert_empty calls
+    assert_includes output, 'skip discovery: review: 05-summary.md exists'
+    refute File.exist?(outdir('codex'))
+    refute File.exist?(outdir('usage.json'))
+  end
 end
