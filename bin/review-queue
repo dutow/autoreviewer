@@ -8,6 +8,7 @@ require 'json'
 require 'yaml'
 require_relative '../lib/review_run/findings_dir'
 require_relative '../lib/review_run/pause'
+require_relative '../lib/review_run/agents'
 
 $stdout.sync = true
 
@@ -24,8 +25,8 @@ class ReviewQueue
     @projects_dir = @workspace_dir
     @dry_run = !ENV['REVIEW_QUEUE_DRYRUN'].to_s.empty?
     @running = true
-    @pause = ReviewRun::Pause.new(File.join(@state_dir, 'paused'))
-    @paused_until = nil
+    @pauses = ReviewRun::Agents::NAMES.to_h { |a| [a, ReviewRun::Pause.for(@state_dir, a)] }
+    @held_key = nil
     @launches = 0
   end
 
@@ -45,12 +46,12 @@ class ReviewQueue
     prune_old
 
     while @running
-      if paused_now?
+      topic_id = next_topic
+      if topic_id && held?(topic_id)
         sleep PAUSE_POLL_SECONDS
         next
       end
 
-      topic_id = next_topic
       if topic_id
         begin
           process_topic(topic_id)
@@ -64,16 +65,26 @@ class ReviewQueue
     end
   end
 
-  # usage-limit pause set by a runner; prints once per pause
-  def paused_now?(now = Time.now)
-    t = @pause.active?(now) && @pause.until_time
-    unless t
-      @paused_until = nil
-      return false
+  def pause_states(now = Time.now)
+    @pauses.transform_values { |p| p.state(now) }
+  end
+
+  # true when no agent can serve the line now; prints once per distinct (line, until)
+  def held?(line, now = Time.now)
+    states = pause_states(now)
+    mode = line_mode(line)
+    if mode && ReviewRun::Agents.held?(mode, states)
+      agent, t = @pauses.select { |a, _| states[a] != :none && (mode == a || !@pauses.key?(mode)) }.map { |a, p| [a, p.until_time] }
+                        .select { |_, u| u }.min_by { |_, u| u }
+      if agent
+        key = [line, t]
+        puts "[#{timestamp}] holding #{line}: #{agent} paused until #{t.strftime('%Y-%m-%d %H:%M:%S')} (usage limit)" unless key == @held_key
+        @held_key = key
+        return true
+      end
     end
-    puts "[#{timestamp}] paused until #{t.strftime('%Y-%m-%d %H:%M:%S')} (usage limit)" unless t == @paused_until
-    @paused_until = t
-    true
+    @held_key = nil
+    false
   end
 
   private
@@ -99,6 +110,18 @@ class ReviewQueue
       topic = "#{topic_prefix_for(project)}#{topic}" if topic.match?(/\A\d+\z/)
       [project, :topic, topic]
     end
+  end
+
+  def line_mode(line)
+    project, kind, = parse_entry(line)
+    return nil if kind == :invalid
+    return 'claude' if kind == :commits
+
+    config, = load_project(project)
+    review = (config || {})['review'] || {}
+    ReviewRun::Agents::Config.from_project(config, route: (review['route'] || 'full').to_s).mode
+  rescue StandardError
+    nil
   end
 
   def topic_prefix_for(project)
@@ -389,6 +412,17 @@ class ReviewQueue
     SH
   end
 
+  def codex_projects?
+    Dir.glob(File.join(@workspace_dir, '*', 'project.yaml')).any? do |f|
+      next false if File.basename(File.dirname(f)).start_with?('_')
+
+      agent = ((YAML.safe_load_file(f) || {})['review'] || {})['agent']
+      agent && agent.to_s != 'claude'
+    rescue StandardError
+      false
+    end
+  end
+
   def preflight
     checks = []
     checks << ['workspace exists', File.directory?(@workspace_dir),
@@ -407,6 +441,13 @@ class ReviewQueue
                 (File.exist?(File.expand_path(File.join(env_or('CLAUDE_CONFIG_DIR', '~/.claude'), '.credentials.json'))) ||
                  !ENV['ANTHROPIC_API_KEY'].to_s.empty?)
     checks << ['claude authenticated', claude_ok, "claude CLI missing or not logged in - run 'task login'"]
+
+    if codex_projects?
+      codex_ok = system('command -v codex > /dev/null 2>&1') &&
+                 (File.exist?(File.expand_path(File.join(env_or('CODEX_HOME', '~/.codex'), 'auth.json'))) ||
+                  !ENV['OPENAI_API_KEY'].to_s.empty? || !ENV['CODEX_API_KEY'].to_s.empty?)
+      checks << ['codex authenticated', codex_ok, "codex CLI missing or not logged in - run 'task codex-login'"]
+    end
 
     failed = false
     checks.each do |name, ok, msg|
