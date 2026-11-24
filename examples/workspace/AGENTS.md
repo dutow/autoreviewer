@@ -14,7 +14,7 @@ A review reads and writes these per-project paths:
 - `review/<topic>/` - patch worktree. `metadata.json` is the **normalized** topic metadata: `{project, topic, version, source_url, base_branch}`.
 - `builds/<topic>/<config>/` - build artifacts (`status.yaml`, `logs/`, `install/`). `builds/master/<config>/` is the base build for comparison.
 - `findings/<topic>/vNN/` - review output; `NN` = `version` from the metadata. Committed.
-- `current-reviews/<topic>` - symlink to the active review's findings dir. When present the orchestrator set it; resolve and use it verbatim, do not recompute the version.
+- `current-reviews/<topic>` - symlink to the active review's findings dir, set by the runner. When the prompt header names an "Output directory" (`$OUTDIR` in the review commands), use that one: it can be a subdir of the version dir. The symlink is for hand runs: resolve it and use it verbatim, do not recompute the version.
 
 Adding or configuring a project - full layout, `project.yaml`, hook contracts, cross-project builds - is in `docs/adding-a-project.md` and `docs/workspace.md` in the infra repo (this workspace's parent directory).
 

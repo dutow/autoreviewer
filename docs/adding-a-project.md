@@ -62,6 +62,8 @@ The phases.yaml models are claude names.
 2. The route's phase (`review`) on the primary, with a header note: add the discovery's code findings missing from its own code review as candidates before validation, and weigh its design concerns in the summary.
    The note is left out when discovery was skipped or wrote no `<secondary>/02-code-review.md`.
 
+`both` needs a review prompt that writes every output under `$OUTDIR`, as the example commands do; an older prompt that hardcodes `findings/<topic>/vNN/` paths writes outside the subdir during discovery and fails the check below.
+
 However discovery ends (done, failed, or skipped on a long limit), the runner checks the version dir: a change outside `<secondary>/` (committed since the first discovery try started, staged or untracked) fails the review, naming the files.
 `metadata.json`, `usage.json` and the paths already uncommitted when the first try started are exempt, and nothing is reverted.
 The commit before the first try stays in `usage.json` as `discovery_base` until discovery is done, with those paths as `discovery_dirty`, so a resumed discovery still catches what an earlier try wrote; remove or revert those files and commit before rerunning.

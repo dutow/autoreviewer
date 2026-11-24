@@ -189,6 +189,7 @@ When a phase hits an agent's usage limit, the runner writes that agent's pause f
 The files are `state/paused` for claude and `state/paused-codex` for codex.
 A claude run counts as a limit hit when the stream had a `rate_limit_event` with status `rejected` and the run did not end cleanly, or when it ended with an error result reading `You've hit your ... limit`.
 The reset time is the event's `resetsAt`; without one it is parsed from the message (`resets 3pm`, `resets Nov 24, 3pm`, as local time), and when that fails too the runner waits an hour.
+A codex run counts as a limit hit when it failed with an error containing `usage limit` (not a context window one); the reset is parsed from `try again at <time>` or `try again in <N> minutes|hours|days` (any case), and without one the runner waits an hour.
 It always waits at least five minutes.
 It gives up after 5 retries and fails the review.
 A pause is short when the reset is within 12 hours (the 5-hour window), and long when it is further out (the weekly limit).
