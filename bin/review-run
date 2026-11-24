@@ -1,8 +1,8 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# Headless review: one `claude -p` session per phase of the project's route.
-#   review-run [--done-file PATH] [--route NAME] [--render PHASE] [--replay] <project> <topic>
+# Headless review: one agent session (`claude -p` or `codex exec`) per phase of the project's route.
+#   review-run [--done-file PATH] [--route NAME] [--render PHASE] [--replay] [--agent NAME] <project> <topic>
 #   review-run [--done-file PATH] --commits <project> <from>..<to>
 
 require 'optparse'
@@ -18,13 +18,15 @@ end
 
 opts = {}
 parser = OptionParser.new do |o|
-  o.banner = 'usage: review-run [--done-file PATH] [--route NAME] [--render PHASE] [--replay] <project> <topic>
+  o.banner = 'usage: review-run [--done-file PATH] [--route NAME] [--render PHASE] [--replay] [--agent NAME] <project> <topic>
 #   review-run [--done-file PATH] --commits <project> <from>..<to>'
   o.on('--done-file PATH', 'touch PATH when finished (success or failure)') { |v| opts[:done_file] = v }
   o.on('--route NAME', 'route from phases.yaml (default: review.route, else full)') { |v| opts[:route] = v }
   o.on('--commits', 'commit review of <project> <range> (single run)') { opts[:commits] = true }
   o.on('--render PHASE', 'print the rendered prompt of PHASE and exit') { |v| opts[:render] = v }
   o.on('--replay', 'replay of a past review (bin/review-replay): adds a header note') { opts[:replay] = true }
+  o.on('--agent NAME', ReviewRun::Agents::NAMES, "run every phase on NAME (#{ReviewRun::Agents::NAMES.join(', ')}), " \
+                                                 'no switching') { |v| opts[:agent] = v }
 end
 
 ok = false
@@ -39,6 +41,8 @@ begin
     workspace_dir: File.expand_path(env_or('WORKSPACE_DIR', File.join(base_dir, 'workspace'))),
     state_dir: File.expand_path(env_or('STATE_DIR', File.join(base_dir, 'state'))),
     claude_bin: env_or('CLAUDE_BIN', 'claude'),
+    codex_bin: env_or('CODEX_BIN', 'codex'),
+    agent: opts[:agent],
     replay: opts[:replay] || false
   )
   if opts[:commits]

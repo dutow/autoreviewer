@@ -11,8 +11,10 @@ require_relative '../../lib/review_run/runner'
 class RunnerTest < Minitest::Test
   ROOT = File.expand_path('../..', __dir__)
   FAKE = File.join(ROOT, 'test', 'fixtures', 'review_run', 'fake-claude')
+  FAKE_CODEX = File.join(ROOT, 'test', 'fixtures', 'review_run', 'fake-codex')
   CLI = File.join(ROOT, 'bin', 'review-run')
-  ENV_KEYS = %w[FAKE_CLAUDE_PLAN FAKE_CLAUDE_CALLS REVIEW_DONE_FILE ANTHROPIC_API_KEY TMUX].freeze
+  ENV_KEYS = %w[FAKE_CLAUDE_PLAN FAKE_CLAUDE_CALLS REVIEW_DONE_FILE ANTHROPIC_API_KEY OPENAI_API_KEY CODEX_API_KEY
+                TMUX].freeze
   API_WARNING = 'WARNING: ANTHROPIC_API_KEY is set; claude -p will bill the API key'.freeze
   OUT_REL = 'p/findings/t1/v2'.freeze
 
@@ -94,7 +96,29 @@ class RunnerTest < Minitest::Test
   def runner(sleeper: ->(s) { @slept << s }, clock: -> { Time.now }, **opts)
     @out = StringIO.new
     ReviewRun::Runner.new(base_dir: @base, workspace_dir: @ws, state_dir: @state,
-                          claude_bin: FAKE, out: @out, sleeper: sleeper, clock: clock, **opts)
+                          claude_bin: FAKE, codex_bin: FAKE_CODEX, out: @out, sleeper: sleeper, clock: clock, **opts)
+  end
+
+  def project_yaml(review)
+    File.write(File.join(@ws, 'p', 'project.yaml'),
+               YAML.dump('name' => 'p', 'review' => { 'phases' => 'p' }.merge(review)))
+    git('add', 'p/project.yaml')
+    git('commit', '-q', '-m', 'project.yaml')
+  end
+
+  # previous reviewed version v1; agent nil: no usage.json
+  def prev_usage(agent)
+    dir = File.join(@ws, 'p', 'findings', 't1', 'v1')
+    FileUtils.mkdir_p(dir)
+    File.write(File.join(dir, '05-summary.md'), "x\n")
+    path = File.join(dir, 'usage.json')
+    if agent
+      File.write(path, JSON.generate('phases' => [{ 'phase' => 'a', 'agent' => agent, 'status' => 'ok' }]))
+    else
+      FileUtils.rm_f(path)
+    end
+    git('add', '-A', '--', 'p/findings/t1/v1')
+    git('commit', '-q', '--allow-empty', '-m', 'prev')
   end
 
   def run_topic(**kw)
@@ -159,7 +183,7 @@ class RunnerTest < Minitest::Test
 
     log = usage_log
     assert_equal 3, log.size
-    assert_equal %w[time project topic version route phase model status cost_usd tokens].sort, log[0].keys.sort
+    assert_equal %w[time project topic version route phase agent model status cost_usd tokens].sort, log[0].keys.sort
     assert_equal ['p', 't1', 2, 'full', 'a', 'opus', 'ok'],
                  log[0].values_at('project', 'topic', 'version', 'route', 'phase', 'model', 'status')
     assert_in_delta 0.5, log[0]['cost_usd']
@@ -556,8 +580,9 @@ class RunnerTest < Minitest::Test
     assert_empty calls
   end
 
-  def cli(*args)
-    env = { 'WORKSPACE_DIR' => @ws, 'STATE_DIR' => @state, 'CLAUDE_BIN' => FAKE, 'TMUX' => nil }
+  def cli(*args, env: {})
+    env = { 'WORKSPACE_DIR' => @ws, 'STATE_DIR' => @state, 'CLAUDE_BIN' => FAKE, 'CODEX_BIN' => FAKE_CODEX,
+            'TMUX' => nil }.merge(env)
     Open3.capture2e(env, CLI, *args, chdir: @root)
   end
 
@@ -610,5 +635,233 @@ class RunnerTest < Minitest::Test
     out, st = cli('--replay', 'p', 't1')
     assert st.success?, out
     assert_equal [true, true, true], calls.map { |c| c['replay_note'] }
+  end
+
+  def agents_of(list)
+    list.map { |c| c['agent'] }
+  end
+
+  def reset_run
+    FileUtils.rm_rf(outdir)
+    FileUtils.rm_f(@calls_file)
+  end
+
+  def codex_pause_file
+    File.join(@state, 'paused-codex')
+  end
+
+  def test_default_mode_is_claude_unchanged
+    assert run_topic, output
+    assert_equal %w[claude] * 3, agents_of(calls)
+    assert_equal %w[claude] * 3, agents_of(usage['phases'])
+    assert_equal %w[claude] * 3, agents_of(usage_log)
+    refute usage.key?('codex_version')
+    assert_includes output, 'agent claude (claude)'
+  end
+
+  def test_codex_mode_uses_codex_model_and_effort
+    project_yaml('agent' => 'codex')
+    assert run_topic, output
+    assert_equal %w[codex] * 3, agents_of(calls)
+    calls.each do |c|
+      assert_equal %w[-m gpt-6.2-astra], c['argv'][c['argv'].index('-m'), 2]
+      assert_includes c['argv'], 'model_reasoning_effort=xhigh'
+    end
+    u = usage
+    assert_equal %w[codex] * 3, agents_of(u['phases'])
+    assert_equal %w[gpt-6.2-astra] * 3, u['phases'].map { |p| p['model'] }
+    assert_equal [nil] * 3, u['phases'].map { |p| p['cost_usd'] }
+    assert_equal '9.9.9', u['codex_version']
+    assert_nil u['total']['cost_usd']
+    assert_equal 'codex', u['agent_mode']
+    assert_equal %w[codex] * 3, agents_of(usage_log)
+    assert_equal %w[gpt-6.2-astra] * 3, usage_log.map { |l| l['model'] }
+  end
+
+  def test_claude_model_override
+    project_yaml('claude' => { 'model' => 'haiku' })
+    assert run_topic, output
+    assert_equal %w[haiku] * 3, calls.map { |c| c['argv'][c['argv'].index('--model') + 1] }
+    assert_equal %w[haiku] * 3, usage['phases'].map { |p| p['model'] }
+  end
+
+  def test_alternate_flips_from_previous
+    project_yaml('agent' => 'alternate')
+    { 'claude' => 'codex', 'codex' => 'claude', nil => 'codex' }.each do |prev, want|
+      reset_run
+      prev_usage(prev)
+      assert run_topic, output
+      assert_equal [want] * 3, agents_of(calls), "previous #{prev.inspect}"
+    end
+  end
+
+  def test_alternate_parity_without_previous
+    project_yaml('agent' => 'alternate')
+    assert run_topic, output
+    assert_equal %w[codex] * 3, agents_of(calls)
+    assert_includes output, 'agent codex (alternate)'
+  end
+
+  def test_alternate_resume_keeps_agent
+    project_yaml('agent' => 'alternate')
+    prev_usage('codex')
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('usage.json'), JSON.generate('phases' => [
+                                                     { 'phase' => 'a', 'agent' => 'codex', 'status' => 'failed',
+                                                       'reason' => 'x', 'cost_usd' => nil, 'duration_ms' => 1 }
+                                                   ]))
+    assert run_topic, output
+    assert_equal %w[codex] * 3, agents_of(calls)
+    assert_equal %w[a b c], calls.map { |c| c['phase'] }
+  end
+
+  def test_alternate_switches_on_limit
+    project_yaml('agent' => 'alternate')
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 1 }))
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal %w[codex claude claude claude], agents_of(calls)
+    assert_equal %w[a a b c], calls.map { |c| c['phase'] }
+    assert_empty @slept
+    ph = usage['phases']
+    assert_equal [%w[a codex limit], %w[a claude ok], %w[b claude ok], %w[c claude ok]],
+                 ph.map { |p| p.values_at('phase', 'agent', 'status') }
+    assert_equal 'opus', ph[1]['model']
+    assert File.exist?(codex_pause_file)
+    refute File.exist?(pause_file)
+    assert_includes output, 'usage limit on codex, switching to claude'
+    assert_equal %w[codex claude claude claude], agents_of(usage_log)
+  end
+
+  def test_alternate_both_paused_waits_earlier
+    project_yaml('agent' => 'alternate')
+    ReviewRun::Pause.for(@state, 'claude').set(NOW + 7200, by: 'other')
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 1,
+                                      'limit_text' => "You've hit your usage limit." }))
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [3720], @slept
+    assert_equal %w[codex codex codex codex], agents_of(calls)
+    assert_equal %w[a a b c], calls.map { |c| c['phase'] }
+    refute_includes output, 'switching to'
+    refute File.exist?(codex_pause_file)
+    assert_equal 'other', JSON.parse(File.read(pause_file))['by']
+  end
+
+  def test_alternate_both_paused_other_earlier_runs_on_it
+    project_yaml('agent' => 'alternate')
+    ReviewRun::Pause.for(@state, 'claude').set(NOW + 1800, by: 'other')
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 1,
+                                      'limit_text' => "You've hit your usage limit." }))
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [1800], @slept
+    assert_equal %w[codex claude claude claude], agents_of(calls)
+  end
+
+  def test_claude_mode_never_switches
+    project_yaml('agent' => 'claude')
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 1 }))
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal 1, @slept.size
+    assert_equal %w[claude] * 4, agents_of(calls)
+    refute File.exist?(codex_pause_file)
+  end
+
+  def test_forced_agent
+    assert run_topic(agent: 'codex'), output
+    assert_equal %w[codex] * 3, agents_of(calls)
+    assert_includes output, 'agent codex (claude, forced)'
+
+    reset_run
+    project_yaml('agent' => 'alternate')
+    prev_usage('codex')
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 1 }))
+    assert run_topic(agent: 'codex', clock: -> { NOW }), output
+    assert_equal %w[codex] * 4, agents_of(calls)
+    assert_equal 1, @slept.size
+    refute_includes output, 'switching to'
+  end
+
+  def test_codex_missing_fails_cleanly
+    project_yaml('agent' => 'codex')
+    refute run_topic(codex_bin: '/nonexistent/codex')
+    assert_includes output, 'ERROR: could not run /nonexistent/codex'
+    refute_includes output, 'Errno'
+    assert_equal ['failed', 'no result event (codex did not start)'], usage['phases'].last.values_at('status', 'reason')
+    refute usage.key?('codex_version')
+
+    done = File.join(@root, 'p-t1.done')
+    out, st = cli('--done-file', done, 'p', 't1', env: { 'CODEX_BIN' => '/nonexistent/codex' })
+    refute st.success?, out
+    assert_includes out, 'could not run /nonexistent/codex'
+    assert File.exist?(done)
+  end
+
+  def test_codex_unparseable_reset_waits_fallback
+    project_yaml('agent' => 'codex')
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 1,
+                                      'limit_text' => "You've hit your usage limit." }))
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [3720], @slept
+    assert_equal %w[codex] * 4, agents_of(calls)
+    assert_equal %w[limit ok ok ok], usage['phases'].map { |p| p['status'] }
+    refute File.exist?(codex_pause_file)
+  end
+
+  def test_long_limit_notifies_in_single_mode
+    path = ENV['PATH']
+    stub = File.join(@root, 'stub-bin')
+    rec = File.join(@root, 'tmux.args')
+    FileUtils.mkdir_p(stub)
+    File.write(File.join(stub, 'tmux'), "#!/bin/sh\necho \"$@\" >> #{rec}\n")
+    File.chmod(0o755, File.join(stub, 'tmux'))
+    ENV['PATH'] = "#{stub}:#{path}"
+    ENV['TMUX'] = 'fake'
+    reset = (NOW + (3 * 86_400)).to_i
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 2,
+                                      'limit_event' => LIMIT_EVENT.merge('resetsAt' => reset) }))
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal 2, @slept.size
+    windows = File.readlines(rec)
+    assert_equal 1, windows.size, windows.join
+    assert_includes windows.first, '-n LIMIT-claude '
+    assert_includes windows.first, 'claude\ usage\ limit\ until'
+  ensure
+    ENV['PATH'] = path
+  end
+
+  def test_short_limit_does_not_notify
+    r = runner(clock: -> { NOW })
+    seen = []
+    r.define_singleton_method(:notify) { |w, _m| seen << w }
+    limit_plan('limit_first' => true)
+    ok = nil
+    capture_io { ok = r.run_topic(project: 'p', topic: 't1') }
+    assert ok, output
+    assert_empty seen
+  end
+
+  def test_bad_agent_config_fails
+    project_yaml('agent' => 'both')
+    refute run_topic
+    assert_includes output, 'review.agent'
+    assert_empty calls
+  end
+
+  def test_warns_on_codex_key
+    ENV['OPENAI_API_KEY'] = 'sk-test'
+    assert run_topic, output
+    refute_includes output, 'OPENAI_API_KEY'
+    reset_run
+    project_yaml('agent' => 'alternate')
+    assert run_topic, output
+    assert_includes output, 'WARNING: OPENAI_API_KEY/CODEX_API_KEY is set; codex exec may bill the API key'
+  end
+
+  def test_cli_agent_flag
+    out, st = cli('--agent', 'codex', 'p', 't1')
+    assert st.success?, out
+    assert_equal %w[codex] * 3, agents_of(calls)
+    out, st = cli('--agent', 'gemini', 'p', 't1')
+    refute st.success?
+    assert_includes out, 'invalid argument'
   end
 end
