@@ -225,6 +225,15 @@ class ReviewQueuePreflightTest < Minitest::Test
     project('_template', "review:\n  agent: codex\n")
     refute_includes run_preflight, 'codex authenticated'
   end
+
+  def test_invalid_agent_has_no_codex_check
+    project('p', "review:\n  agent: gemini\n")
+    refute_includes run_preflight, 'codex authenticated'
+    %w[codex both alternate].each do |mode|
+      project('p', "review:\n  agent: #{mode}\n")
+      assert_includes run_preflight, 'codex authenticated', mode
+    end
+  end
 end
 
 class ReviewQueueLaunchTest < Minitest::Test

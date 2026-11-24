@@ -417,7 +417,7 @@ class ReviewQueue
       next false if File.basename(File.dirname(f)).start_with?('_')
 
       agent = ((YAML.safe_load_file(f) || {})['review'] || {})['agent']
-      agent && agent.to_s != 'claude'
+      (ReviewRun::Agents::MODES - ['claude']).include?(agent.to_s)
     rescue StandardError
       false
     end
