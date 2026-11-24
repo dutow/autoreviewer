@@ -26,6 +26,9 @@ module ReviewRun
     CHILD_ENV = Session::CHILD_ENV
     API_KEY_WARNING = 'WARNING: ANTHROPIC_API_KEY is set; claude -p will bill the API key'.freeze
     CODEX_KEY_WARNING = 'WARNING: OPENAI_API_KEY/CODEX_API_KEY is set; codex exec may bill the API key'.freeze
+    DISCOVERY = 'discovery'.freeze
+    DISCOVERY_OUTPUT = '02-code-review.md'.freeze
+    DISCOVERY_SKIP = 'usage limit (long)'.freeze
 
     # agent: the one running now, phases run on it; a usage limit may switch it
     Review = Struct.new(:project, :topic, :version, :route, :yaml, :manifest, :phases,
@@ -57,6 +60,7 @@ module ReviewRun
     def run_topic(project:, topic:, route: nil)
       warn_api_key
       rv = load_review(project, topic, route)
+      rv.phases = both_phases(rv) if both?(rv)
       warn_codex_key(rv)
       rel = FindingsDir.prepare(base_dir: @base_dir, project_dir: project_dir(project), topic: topic)
       raise RunError, 'could not prepare findings dir' unless rel
@@ -96,7 +100,7 @@ module ReviewRun
       prompt = Prompt.render_command(path: commit_command_path(project), args: range)
       log = File.join(@state_dir, 'logs', window, 'commits.jsonl')
       say "=== commit review #{project} #{range}, model opus"
-      _started, result, status, reason = run_past_limit(rv, phase, prompt, log)
+      _started, result, status, reason = run_past_limit(rv, phase, log) { prompt }
       reason ||= session_failure(rv.agent, result, status)
       log_usage(rv, phase, reason ? 'failed' : 'ok', result)
       return fail_review(project, window.delete_prefix("#{project}-"), reason) if reason
@@ -169,6 +173,7 @@ module ReviewRun
     def agent_desc(rv)
       desc = rv.agents.mode
       desc += ', forced' if @forced
+      desc += ", discovery on #{rv.agents.secondary}" if both?(rv)
       if switchable?(rv)
         now = @clock.call
         paused = Agents::NAMES.select { |a| @pauses[a].active?(now) }
@@ -214,8 +219,10 @@ module ReviewRun
                   prev_dir: rv.prev_dir, index: idx + 1, total: rv.phases.size, replay: @replay)
     end
 
-    # resume: output present and last run of the phase was not cut short
+    # resume: phase skipped before, or output present and last run of the phase was not cut short
     def skip_reason(phase, outdir_abs, usage)
+      return 'skipped earlier' if usage.last_status(phase.name) == 'skipped'
+
       if phase.output && File.exist?(File.join(outdir_abs, phase.output)) &&
          !%w[failed limit].include?(usage.last_status(phase.name))
         return "#{phase.output} exists"
@@ -225,19 +232,28 @@ module ReviewRun
     end
 
     def commit_output(rv, phase)
+      if discovery?(rv, phase)
+        return commit([discovery_dir(rv)], "review(#{rv.topic}): #{rv.agents.secondary} discovery (runner)")
+      end
       return true unless phase.output
 
       commit([File.join(rv.outdir, phase.output)], "review(#{rv.topic}): #{phase.name} output (runner)")
     end
 
     def run_phase(rv, phase, idx, usage)
-      prompt = Prompt.render(manifest: rv.manifest, phase: phase, ctx: context(rv, idx))
+      discovery = discovery?(rv, phase)
+      rv.agent = discovery ? rv.agents.secondary : rv.agents.primary if both?(rv)
       log = File.join(@state_dir, 'logs', "#{rv.window}-v#{rv.version}", format('%02d-%s.jsonl', idx + 1, phase.name))
       effort = rv.agents.effort(rv.agent, phase)
       say "=== phase #{phase.name} (#{idx + 1} of #{rv.phases.size}), agent #{rv.agent}, " \
           "model #{rv.agents.model(rv.agent, phase)}#{", effort #{effort}" if effort}"
-      started, result, status, reason = run_past_limit(rv, phase, prompt, log, usage)
-      reason ||= phase_failure(rv, phase, result, status)
+      before = head if discovery
+      started, result, status, reason = run_past_limit(rv, phase, log, usage) do
+        Prompt.render(manifest: rv.manifest, phase: phase, ctx: phase_context(rv, phase, idx, usage))
+      end
+      return skip_discovery(rv, phase, usage) if reason == DISCOVERY_SKIP
+
+      reason ||= phase_failure(rv, phase, result, status, before)
       log_usage(rv, phase, reason ? 'failed' : 'ok', result)
       if reason
         usage.fail(phase: phase.name, reason: reason, result: result, started_at: started, agent: rv.agent)
@@ -251,12 +267,16 @@ module ReviewRun
       true
     end
 
-    def phase_failure(rv, phase, result, status)
+    # before: HEAD before a discovery session, for the guard
+    def phase_failure(rv, phase, result, status, before = nil)
       reason = session_failure(rv.agent, result, status)
       return reason if reason || !phase.output
 
       file = File.join(rv.outdir, phase.output)
       return "output #{file} missing" unless File.exist?(File.join(@workspace_dir, file))
+
+      stray = before && discovery_guard(rv, before)
+      return stray if stray
 
       commit_output(rv, phase) ? nil : "could not commit #{file}"
     end
@@ -268,14 +288,16 @@ module ReviewRun
     end
 
     # usage limit: pause the agent, then switch (alternate) or wait for the reset and re-run;
-    # reason set once retries run out
-    def run_past_limit(rv, phase, prompt, log, usage = nil)
+    # reason set once retries run out. The block gives the prompt for the agent of each try.
+    def run_past_limit(rv, phase, log, usage = nil)
       hits = 0
       notified = false
       loop do
+        return [nil, nil, nil, DISCOVERY_SKIP] unless both_pick(rv, phase, usage)
+
         pause = @pauses[rv.agent]
         started = @clock.call
-        result, status, rate_limit = run_session(rv, phase, prompt, log, usage)
+        result, status, rate_limit = run_session(rv, phase, yield, log, usage)
         unless limit_hit?(result, status, rate_limit)
           pause.clear if hits.positive? && pause.by == rv.window
           return [started, result, status, nil]
@@ -292,7 +314,7 @@ module ReviewRun
                       started_at: started, agent: rv.agent)
           usage.write
         end
-        next if switch_agent(rv)
+        next if switch_agent(rv) || both_long_limit?(rv, phase, until_t)
 
         notified ||= notify_long_limit(rv, until_t)
         wait_for_reset(rv, phase, until_t, hits)
@@ -366,6 +388,113 @@ module ReviewRun
       @versions[agent] ||= @sessions[agent].version
     end
 
+    # both: the route's one phase runs twice, as discovery on the secondary into
+    # <outdir>/<secondary>/, then as itself on the primary
+
+    def both?(rv)
+      !@forced && rv.agents.mode == 'both'
+    end
+
+    def discovery?(rv, phase)
+      both?(rv) && phase.name == DISCOVERY
+    end
+
+    def discovery_dir(rv)
+      File.join(rv.outdir, rv.agents.secondary)
+    end
+
+    def both_phases(rv)
+      raise RunError, 'review.agent both needs a one-phase route' unless rv.phases.size == 1
+
+      ph = rv.phases.first
+      [Phase.new(**ph.to_h.merge(name: DISCOVERY, output: "#{rv.agents.secondary}/#{DISCOVERY_OUTPUT}")), ph]
+    end
+
+    # each both session runs the whole one-phase prompt, so the header says 1 of 1
+    def phase_context(rv, phase, idx, usage)
+      ctx = context(rv, idx)
+      return ctx unless both?(rv)
+
+      ctx.index = ctx.total = 1
+      if phase.name == DISCOVERY
+        ctx.outdir = discovery_dir(rv)
+        ctx.note = Prompt::DISCOVERY_NOTE
+      elsif rv.agent == rv.agents.primary && discovered?(rv, usage)
+        ctx.note = Prompt.primary_note(discovery_dir(rv))
+      end
+      ctx
+    end
+
+    def discovered?(rv, usage)
+      usage.last_status(DISCOVERY) != 'skipped' &&
+        File.exist?(File.join(@workspace_dir, discovery_dir(rv), DISCOVERY_OUTPUT))
+    end
+
+    # sets the agent before each try; false: skip discovery, the secondary is long-limited.
+    # The review runs on the primary unless it is long-limited, then on the other one;
+    # both long-limited: wait for the earlier reset.
+    def both_pick(rv, phase, usage)
+      return true unless both?(rv)
+
+      now = @clock.call
+      return !@pauses[rv.agent].long?(now) if phase.name == DISCOVERY
+
+      primary = rv.agents.primary
+      other = rv.agents.secondary
+      agent = [primary, other].find { |a| !@pauses[a].long?(now) } || wait_for_earlier(primary, other, now)
+      if agent == other && rv.agent != other
+        say "primary #{primary} long-limited, review runs on #{other} alone"
+        usage.degraded!
+      end
+      rv.agent = agent
+      true
+    end
+
+    # not waited out: both_pick degrades on the next try
+    def both_long_limit?(rv, phase, until_t)
+      return false unless both?(rv) && until_t - @clock.call > Pause::LONG
+
+      say "#{rv.agent} usage limit in phase #{phase.name}, paused until #{fmt_time(until_t)}"
+      true
+    end
+
+    def wait_for_earlier(primary, other, now)
+      agent, t = [primary, other].map { |a| [a, @pauses[a].until_time || now] }.min_by(&:last)
+      say "#{primary} and #{other} long-limited, waiting for #{agent} until #{fmt_time(t)}"
+      @sleeper.call([(t - now).ceil, 0].max)
+      agent
+    end
+
+    def skip_discovery(rv, phase, usage)
+      t = @pauses[rv.agent].until_time
+      say "#{rv.agent} long-limited#{" until #{fmt_time(t)}" if t}, discovery skipped"
+      usage.skip(phase: phase.name, agent: rv.agent, reason: DISCOVERY_SKIP, started_at: @clock.call)
+      usage.degraded!
+      usage.write
+      true
+    end
+
+    # changes under outdir since before (committed, staged, untracked) outside the discovery subdir;
+    # no revert, the agent may have committed them
+    def discovery_guard(rv, before)
+      ok, committed = git('diff', '--name-only', '--no-renames', '-z', before, 'HEAD', '--', rv.outdir)
+      ok2, status = git('status', '--porcelain', '--no-renames', '-z', '--untracked-files=all', '--', rv.outdir)
+      return 'discovery guard: git failed' unless ok && ok2
+
+      own = "#{discovery_dir(rv)}/"
+      exempt = %w[metadata.json usage.json].map { |f| File.join(rv.outdir, f) }
+      paths = committed.split("\0") + status.split("\0").map { |e| e[3..] }
+      stray = paths.uniq.reject { |f| f.start_with?(own) || exempt.include?(f) }
+      "discovery wrote outside #{discovery_dir(rv)}: #{stray.join(', ')}" unless stray.empty?
+    end
+
+    def head
+      ok, out = git('rev-parse', 'HEAD')
+      raise RunError, 'git rev-parse HEAD failed' unless ok
+
+      out.strip
+    end
+
     def finish(rv, usage)
       run_findings_metadata(rv)
       return fail_review(rv.project, rv.topic, 'could not commit usage.json') unless save_usage(rv, usage)
@@ -396,7 +525,7 @@ module ReviewRun
                          'time' => @clock.call.iso8601, 'project' => rv.project, 'topic' => rv.topic,
                          'version' => rv.version, 'route' => rv.route, 'phase' => phase.name, 'agent' => rv.agent,
                          'model' => rv.agents.model(rv.agent, phase), 'status' => status,
-                         'cost_usd' => result ? result.cost_usd : 0.0,
+                         'cost_usd' => Usage.cost(result, rv.agent),
                          'tokens' => result&.tokens || Usage::TOKEN_KEYS.to_h { |k| [k, 0] }
                        })
     end

@@ -2,9 +2,12 @@
 # frozen_string_literal: true
 
 # Test double for `codex exec --json`. Same plan/calls contract as fake-claude.
-# Plan (FAKE_CLAUDE_PLAN, JSON): {"<phase>": {"write": [..], "files": {"<path>": "<body>"}, "commit": true, "exit": 0,
-#   "limit_times": 0, "limit_text": "...", "fail_text": "...", "text": "..."}}
+# Plan (FAKE_CLAUDE_PLAN, JSON): {"<phase>": {"write": [..], "files": {"<path>": "<body>"}, "commit": true,
+#   "commit_files": false, "exit": 0, "limit_times": 0, "limit_agent": null, "limit_text": "...",
+#   "fail_text": "...", "text": "..."}}
+# commit_files: also commit the files entries.
 # limit_times: the first N calls for the phase hit the usage limit (error + turn.failed, exit 1).
+# limit_agent: only that agent hits the limit.
 # fail_text: turn.failed with that text, exit 1.
 
 require 'json'
@@ -36,7 +39,9 @@ if calls_file
     f.puts(JSON.generate('agent' => 'codex', 'phase' => phase, 'argv' => ARGV,
                          'done_file_env' => ENV.key?('REVIEW_DONE_FILE'),
                          'env' => ENV.slice(*ENV_SEEN), 'cwd' => Dir.pwd, 'outdir' => outdir,
-                         'replay_note' => prompt.include?('Replay of a past review:')))
+                         'replay_note' => prompt.include?('Replay of a past review:'),
+                         'note' => prompt.include?('independent discovery pass'),
+                         'discovery_note' => prompt.include?('Discovery pass:')))
   end
 end
 
@@ -50,15 +55,21 @@ def fail_turn(text)
   exit 1
 end
 
-if prior.count { |c| c['agent'] == 'codex' && c['phase'] == phase } < step['limit_times']
+limit_times = step['limit_agent'] && step['limit_agent'] != 'codex' ? 0 : step['limit_times']
+if prior.count { |c| c['agent'] == 'codex' && c['phase'] == phase } < limit_times
   fail_turn(step['limit_text'] || LIMIT_TEXT)
 end
 fail_turn(step['fail_text']) if step['fail_text']
 
-(step['files'] || {}).each do |path, body|
+extra = (step['files'] || {}).map do |path, body|
   path = File.expand_path(path)
   FileUtils.mkdir_p(File.dirname(path))
   File.write(path, body)
+  path
+end
+if step['commit_files'] && !extra.empty?
+  system('git', 'add', '--', *extra, out: File::NULL, err: File::NULL) &&
+    system('git', 'commit', '-q', '-m', "fake #{phase} files", '--', *extra, out: File::NULL, err: File::NULL)
 end
 
 files = step['write'].map { |name| File.join(outdir.to_s, name) }

@@ -50,9 +50,38 @@ The phases.yaml models are claude names.
 
 `alternate` picks the agent of a review:
 
-1. A review already started keeps its agent; else the agent that did not review the previous version (claude when its `usage.json` names none); else the topic number's parity (even claude, odd codex).
+1. A review already started keeps its agent; else the agent that did not review the previous version (claude when its `usage.json` names none); else the topic number's parity (even claude, odd codex; a topic without digits uses the parity of a stable hash of its name).
 2. If that agent is paused by a usage limit and the other is not, the other one runs.
 3. A usage limit during the review hands the rest of it to the other agent at once; with both paused the runner waits for the earlier reset and goes on with that agent.
+
+`both` runs the route's one phase twice; a route with more phases fails the review:
+
+1. `discovery` on the secondary, the agent that is not `primary`.
+   The prompt is the single prompt with `$OUTDIR` and the header's output directory set to `<outdir>/<secondary>/`, plus a header note to stop after the overview, design review and code review.
+   The runner commits that subdir after the session.
+2. The route's phase (`review`) on the primary, with a header note: add the discovery's code findings missing from its own code review as candidates before validation, and weigh its design concerns in the summary.
+   The note is left out when discovery was skipped or wrote no `<secondary>/02-code-review.md`.
+
+After discovery the runner checks the version dir: a change outside `<secondary>/` (committed since the session started, staged or untracked) fails the review, naming the files.
+`metadata.json` and `usage.json` are exempt, and nothing is reverted.
+A resumed review does not rerun a finished or skipped discovery.
+`--agent` (below) runs a plain one-agent review, with no discovery.
+
+A usage limit is short when its reset is within 12 hours, long when it is further out:
+
+| mode | short limit | long limit |
+|---|---|---|
+| `claude` / `codex` | wait for the reset and retry | same, plus a tmux notice window naming the agent and the reset time |
+| `alternate` | the other agent takes over | the other agent takes over |
+| `both` | wait for the reset (keep both models) | degrade to one agent, below |
+
+`both` on a long limit:
+
+- secondary long-limited, before or during discovery: discovery is skipped, the primary reviews alone with no discovery note.
+- primary long-limited: the other agent runs the review phase alone, with no discovery note; its discovery output stays in the subdir.
+- both long-limited: the runner waits for the earlier reset and goes on with that agent.
+
+A degraded review has `"degraded": true` in `usage.json`, a skipped discovery a `skipped` entry.
 
 `claude` and `codex` never switch: a limit waits for the reset, and one more than 12 hours away also opens a tmux window `LIMIT-<agent>`.
 `bin/review-run --agent claude|codex` forces one agent for a run, whatever the mode, with no switching.
@@ -117,7 +146,7 @@ Phase sessions run without it, so one finished phase never closes the window.
 Phase sessions have `REVIEW_RUN=1` instead; a hook that should act in every review session, like the `PermissionRequest` auto-allow, checks `[ -n "$REVIEW_DONE_FILE$REVIEW_RUN" ]`.
 
 A usage-limit hit does not end the review: the runner waits for the reset and retries (see [setup.md](setup.md#usage-limit-pause)).
-With `review.agent: alternate` the other agent takes over instead (see [Review agent](#review-agent)).
+With `review.agent: alternate` the other agent takes over instead, and with `both` a long limit leaves the review to one agent (see [Review agent](#review-agent)).
 
 ## Review phases
 

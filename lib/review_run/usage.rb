@@ -11,6 +11,13 @@ module ReviewRun
       File.open(log_path, 'a') { |f| f.puts(JSON.generate(entry)) }
     end
 
+    # no result: claude 0.0 as before, codex unknown
+    def self.cost(result, agent)
+      return result.cost_usd if result
+
+      agent == 'codex' ? nil : 0.0
+    end
+
     def self.review_agent(path)
       phases = JSON.parse(File.read(path)).fetch('phases')
       last = phases.reverse_each.find { |p| p.is_a?(Hash) && p['status'] == 'ok' }
@@ -126,7 +133,7 @@ module ReviewRun
         'started_at' => started_at.iso8601,
         'duration_ms' => result&.duration_ms || 0,
         'num_turns' => result&.num_turns || 0,
-        'cost_usd' => result ? result.cost_usd : 0.0,
+        'cost_usd' => Usage.cost(result, agent),
         'session_id' => result&.session_id,
         'status' => status,
         'tokens' => result&.tokens || TOKEN_KEYS.to_h { |k| [k, 0] },
