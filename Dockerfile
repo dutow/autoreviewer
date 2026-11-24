@@ -33,8 +33,8 @@ RUN sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -b /usr/local/bin
 RUN npm install -g --no-fund --no-audit @anthropic-ai/claude-code \
  && npm cache clean --force
 
-# codex CLI
-RUN npm install -g --no-fund --no-audit @openai/codex \
+# codex CLI, pinned: the runner's codex stream parser was built against 0.171.0 output
+RUN npm install -g --no-fund --no-audit @openai/codex@0.171.0 \
  && npm cache clean --force
 
 # default git identity so 'git am' and findings commits never fail on a fresh
