@@ -489,8 +489,10 @@ module ReviewRun
     # runs on every discovery exit: changes under outdir since base (committed, staged, untracked)
     # outside the discovery subdir; no revert, the agent may have committed them
     def discovery_guard(rv, base)
-      ok, committed = git('diff', '--name-only', '--no-renames', '-z', base, 'HEAD', '--', rv.outdir)
-      ok2, status = git('status', '--porcelain', '--no-renames', '-z', '--untracked-files=all', '--', rv.outdir)
+      ok, committed = git('diff', '--name-only', '--no-renames', '-z', base, 'HEAD', '--', rv.outdir,
+                          stdout_only: true)
+      ok2, status = git('status', '--porcelain', '--no-renames', '-z', '--untracked-files=all', '--', rv.outdir,
+                        stdout_only: true)
       return 'discovery guard: git failed' unless ok && ok2
 
       own = "#{discovery_dir(rv)}/"
@@ -501,7 +503,7 @@ module ReviewRun
     end
 
     def head
-      ok, out = git('rev-parse', 'HEAD')
+      ok, out = git('rev-parse', 'HEAD', stdout_only: true)
       raise RunError, 'git rev-parse HEAD failed' unless ok
 
       out.strip
@@ -560,11 +562,14 @@ module ReviewRun
       ok && out.strip.empty?
     end
 
-    def git(*args)
+    # stdout_only: output without stderr, so a git warning never reads as a path
+    def git(*args, stdout_only: false)
       tries = 0
       loop do
-        out, st = Open3.capture2e('git', *args, chdir: @workspace_dir)
-        return [true, out] if st.success?
+        out, err, st = Open3.capture3('git', *args, chdir: @workspace_dir)
+        return [true, stdout_only ? out : out + err] if st.success?
+
+        out += err
 
         if out.include?('index.lock') && tries < GIT_RETRIES
           tries += 1

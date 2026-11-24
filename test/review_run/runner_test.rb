@@ -1181,4 +1181,23 @@ class RunnerTest < Minitest::Test
     assert_empty calls
     refute File.exist?(outdir)
   end
+
+  def test_both_guard_reads_git_stdout_only
+    both_setup
+    path = ENV['PATH']
+    real = path.split(File::PATH_SEPARATOR).map { |d| File.join(d, 'git') }.find { |f| File.executable?(f) }
+    stub = File.join(@root, 'git-bin')
+    FileUtils.mkdir_p(stub)
+    File.write(File.join(stub, 'git'), <<~SH)
+      #!/bin/sh
+      case " $* " in *' -z '*|' rev-parse '*) echo 'warning: noise' >&2 ;; esac
+      exec #{real} "$@"
+    SH
+    File.chmod(0o755, File.join(stub, 'git'))
+    ENV['PATH'] = "#{stub}:#{path}"
+    assert run_topic, output
+    assert_equal %w[discovery review], calls.map { |c| c['phase'] }
+  ensure
+    ENV['PATH'] = path
+  end
 end
