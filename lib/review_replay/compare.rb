@@ -37,7 +37,7 @@ module ReviewReplay
       costs = phases.filter_map { |p| p['cost_usd'] if p['cost_usd'].is_a?(Numeric) }
       tokens = ReviewRun::Usage::TOKEN_KEYS.to_h { |k| [k, phases.sum { |p| p.dig('tokens', k).to_i }] }
       { 'cost_usd' => costs.empty? ? nil : costs.sum.round(4), 'tokens' => tokens,
-        'phases' => phases.map { |p| p.slice('phase', 'model', 'status', 'cost_usd') } }
+        'phases' => phases.map { |p| p.slice('phase', 'model', 'status', 'cost_usd').merge('agent' => p['agent'] || 'claude') } }
     rescue JSON::ParserError
       nil
     end
