@@ -60,6 +60,14 @@ class CodexStreamTest < Minitest::Test
     assert_equal now + 3600, limit_result("You've hit your usage limit.").limit_reset(now)
   end
 
+  def test_reset_capitalized
+    now = Time.local(2026, 11, 24, 14, 0)
+    r = limit_result("You've hit your usage limit. Try again at Nov 30th, 2026 9:00 AM.")
+    assert r.limit_hit?
+    assert_equal Time.local(2026, 11, 30, 9, 0), r.limit_reset(now)
+    assert_equal now + (2 * 3600), limit_result("You've hit your usage limit. Try again in 2 Hours.").limit_reset(now)
+  end
+
   def test_context_limit_is_not_usage_limit
     refute limit_result('usage limit of the context window').limit_hit?
   end

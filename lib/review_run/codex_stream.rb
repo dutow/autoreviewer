@@ -48,7 +48,7 @@ module ReviewRun
   class CodexResult
     NOT_LIMIT_RE = /context/i
     LIMIT_RE = /usage limit/i
-    AT_RE = /try again at (.+?)(?:\.(?:\s|\z)|\z)/m
+    AT_RE = /try again at (.+?)(?:\.(?:\s|\z)|\z)/mi
     IN_RE = /try again in (\d+)\s*(minute|hour|day)s?/i
     UNITS = { 'minute' => 60, 'hour' => 3600, 'day' => 86_400 }.freeze
     TIME_ONLY_RE = /\A\d{1,2}(?::\d{2}){0,2}\s*(?:am|pm)?\z/i
