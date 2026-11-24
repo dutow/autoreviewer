@@ -18,13 +18,17 @@ module ReviewRun
     end
 
     def long?(now)
-      active?(now) && until_time - now > LONG
+      state(now) == :long
     end
 
     def state(now)
-      return :none unless active?(now)
+      t = until_time
+      unless t && t > now
+        clear
+        return :none
+      end
 
-      long?(now) ? :long : :short
+      t - now > LONG ? :long : :short
     end
 
     def set(until_time, by:)

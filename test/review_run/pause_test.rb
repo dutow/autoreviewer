@@ -73,6 +73,14 @@ class PauseTest < Minitest::Test
     refute File.exist?(p.path)
   end
 
+  def test_state_corrupt_file_none_and_removed
+    FileUtils.mkdir_p(File.dirname(@path))
+    File.write(@path, 'not json')
+    assert_equal :none, @pause.state(@now)
+    refute @pause.long?(@now)
+    refute File.exist?(@path)
+  end
+
   def test_clear
     @pause.set(@now + 60, by: 'p-t1')
     @pause.clear
