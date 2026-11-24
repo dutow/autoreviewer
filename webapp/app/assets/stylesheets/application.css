@@ -92,6 +92,7 @@ table.reviews tr.row-bug td:first-child { box-shadow: inset 3px 0 var(--sev-bug)
 table.reviews tr.row-likely-bug td:first-child { box-shadow: inset 3px 0 var(--sev-likely); }
 table.costs th, table.costs td.num { text-align: right; font-variant-numeric: tabular-nums; }
 table.costs th.day { text-align: left; }
+table.costs .grp { border-left: 2px solid var(--border); }
 table.costs tfoot td { font-weight: 600; border-top: 2px solid var(--border); }
 p.skipped { margin-top: .8rem; font-size: .85rem; }
 .sev { display: inline-block; padding: 0 .4rem; border-radius: 99px; font-weight: 600;
