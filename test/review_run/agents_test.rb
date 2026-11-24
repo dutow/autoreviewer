@@ -36,6 +36,8 @@ class AgentsTest < Minitest::Test
     assert_raises(ReviewRun::Agents::ConfigError) { cfg('agent' => 'gemini') }
     assert_raises(ReviewRun::Agents::ConfigError) { cfg('agent' => 'both', 'primary' => 'x') }
     assert_raises(ReviewRun::Agents::ConfigError) { cfg({ 'agent' => 'both' }, route: 'full') }
+    assert_equal 'both', cfg({ 'agent' => 'both' }, route: nil).mode
+    assert_raises(ReviewRun::Agents::ConfigError) { cfg({ 'agent' => 'gemini' }, route: nil) }
   end
 
   def test_error_names_key

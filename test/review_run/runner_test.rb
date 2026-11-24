@@ -1299,4 +1299,11 @@ class RunnerTest < Minitest::Test
     refute File.exist?(outdir('codex'))
     refute File.exist?(outdir('usage.json'))
   end
+
+  def test_forced_agent_skips_both_route_rule
+    project_yaml('agent' => 'both')
+    assert run_topic(agent: 'claude'), output
+    assert_equal [%w[a claude], %w[b claude], %w[c claude]], phase_agents
+    assert_includes runner.render(project: 'p', topic: 't1', phase: 'a'), "Do a for t1 into #{OUT_REL}\n"
+  end
 end

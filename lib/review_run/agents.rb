@@ -31,7 +31,8 @@ module ReviewRun
         unless NAMES.include?(@primary)
           raise ConfigError, "review.primary: unknown '#{@primary}' (expected #{NAMES.join(', ')})"
         end
-        if @mode == 'both' && route != 'single'
+        # route nil: the mode is not used, its route rule not checked
+        if @mode == 'both' && route && route != 'single'
           raise ConfigError, "review.agent: 'both' needs route single, got '#{route}'"
         end
       end

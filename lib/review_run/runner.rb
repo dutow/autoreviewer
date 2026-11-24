@@ -114,7 +114,7 @@ module ReviewRun
     end
 
     def render(project:, topic:, phase:, route: nil)
-      rv = load_review(project, topic, route)
+      rv = load_review(project, topic, route, use_mode: false)
       idx = rv.phases.index { |p| p.name == phase }
       raise RunError, "phase #{phase} not in route #{rv.route}" unless idx
 
@@ -127,7 +127,7 @@ module ReviewRun
       File.join(@workspace_dir, project)
     end
 
-    def load_review(project, topic, route)
+    def load_review(project, topic, route, use_mode: true)
       yaml = File.join(project_dir(project), 'project.yaml')
       raise RunError, "project.yaml not found: #{yaml}" unless File.exist?(yaml)
 
@@ -140,7 +140,8 @@ module ReviewRun
       raise RunError, "phase manifest not found: #{mpath}" unless File.exist?(mpath)
 
       begin
-        agents = Agents::Config.from_project(config, route: route)
+        # route rule of the mode only when the mode runs: not forced, not rendered
+        agents = Agents::Config.from_project(config, route: use_mode && !@forced ? route : nil)
       rescue Agents::ConfigError => e
         raise RunError, "#{yaml}: #{e.message}"
       end

@@ -85,7 +85,7 @@ A usage limit is short when its reset is within 12 hours, long when it is furthe
 A degraded review has `"degraded": true` in `usage.json`, a skipped discovery a `skipped` entry.
 
 `claude` and `codex` never switch: a limit waits for the reset, and one more than 12 hours away also opens a tmux window `LIMIT-<agent>`.
-`bin/review-run --agent claude|codex` forces one agent for a run, whatever the mode, with no switching.
+`bin/review-run --agent claude|codex` forces one agent for a run, whatever the mode, with no switching; a `both` project then takes any route.
 codex needs its CLI installed and logged in (see [setup.md](setup.md)); set `review.agent` only after that.
 An `OPENAI_API_KEY` or `CODEX_API_KEY` in the environment gets a warning, like `ANTHROPIC_API_KEY`: codex may bill it.
 
