@@ -80,6 +80,7 @@ class ReviewPoll
         master_dir:  File.join(@projects_dir, dir_name, 'master'),
         findings_dir: File.join(@projects_dir, dir_name, 'findings'),
         only_reviewed: cfg.dig('poll', 'only_reviewed') == true,
+        skip_drafts: cfg.dig('poll', 'skip_drafts') == true,
         hackorum:    cfg.dig('poll', 'hackorum') == true,
         commit_review: cfg['commit_review'],
         debounce_minutes: [(cfg.dig('poll', 'debounce_minutes') || DEBOUNCE_MINUTES_DEFAULT).to_i, 0].max,
@@ -116,12 +117,12 @@ class ReviewPoll
   end
 
   # Pure classifier. prev: nil (project not yet baselined) or Hash{topic => sha}.
-  # prs: Array of {topic:, head:}. Returns {baseline:, decisions:[{topic:,head:,status:}]}.
+  # prs: Array of {topic:, head:, draft:}. Returns {baseline:, decisions:[{topic:,head:,draft:,status:}]}.
   def plan(prev, prs)
     return { baseline: true, decisions: [] } if prev.nil?
     decisions = prs.map do |pr|
       status = prev[pr[:topic]] == pr[:head] ? :unchanged : :changed
-      { topic: pr[:topic], head: pr[:head], status: status }
+      { topic: pr[:topic], head: pr[:head], draft: pr[:draft] == true, status: status }
     end
     { baseline: false, decisions: decisions }
   end
@@ -429,12 +430,14 @@ class ReviewPoll
   def open_prs(source)
     raw = nil
     IO.popen(['gh', '-R', source, 'pr', 'list', '--state', 'open',
-              '--json', 'number,headRefOid,baseRefName', '--limit', '200']) { |io| raw = io.read }
+              '--json', 'number,headRefOid,baseRefName,isDraft', '--limit', '200']) { |io| raw = io.read }
     unless $?.success?
       log "WARNING: gh pr list failed for #{source}, skipping this cycle"
       return nil
     end
-    JSON.parse(raw).map { |p| { number: p['number'], head: p['headRefOid'], base: p['baseRefName'] } }
+    JSON.parse(raw).map do |p|
+      { number: p['number'], head: p['headRefOid'], base: p['baseRefName'], draft: p['isDraft'] == true }
+    end
   rescue JSON::ParserError => e
     log "WARNING: could not parse gh output for #{source}: #{e.message}"
     nil
@@ -488,7 +491,7 @@ class ReviewPoll
       if proj[:source]
         raw = fetch.call(proj[:source])
         next if raw.nil?
-        prs = raw.map { |p| { topic: "#{proj[:prefix]}#{p[:number]}", head: p[:head] } }
+        prs = raw.map { |p| { topic: "#{proj[:prefix]}#{p[:number]}", head: p[:head], draft: p[:draft] == true } }
         bases = raw.map { |p| p[:base] }.compact.uniq | [proj[:base_branch]]
       else
         prs = []
@@ -512,7 +515,9 @@ class ReviewPoll
       cur = @state[proj[:name]]
       hk_keep = cur.is_a?(Hash) ? cur['hackorum'] : nil
       if result[:baseline]
-        new_map = prs.to_h { |pr| [pr[:topic], pr[:head]] }
+        skipped, tracked = prs.partition { |pr| proj[:skip_drafts] && pr[:draft] }
+        new_map = tracked.to_h { |pr| [pr[:topic], pr[:head]] }
+        new_map['drafts'] = skipped.to_h { |pr| [pr[:topic], pr[:head]] } unless skipped.empty?
         new_map['commit_review'] = cr if cr
         new_map['hackorum'] = hk_keep if hk_keep
         @state[proj[:name]] = new_map
@@ -521,7 +526,19 @@ class ReviewPoll
         new_state = {}
         open_topics = prs.map { |pr| pr[:topic] }
         pending = (prev['debounce'].is_a?(Hash) ? prev['debounce'] : {}).select { |t, _| open_topics.include?(t) }
+        prev_drafts = prev['drafts'].is_a?(Hash) ? prev['drafts'] : {}
+        drafts = {}
         result[:decisions].each do |d|
+          if proj[:skip_drafts] && d[:draft]
+            # Drafts are not tracked: once marked ready for review, the PR is
+            # polled as new (already_handled? covers an unchanged reviewed head).
+            drafts[d[:topic]] = d[:head]
+            pending = pending.reject { |t, _| t == d[:topic] }
+            unless prev_drafts[d[:topic]] == d[:head]
+              log "#{proj[:name]}: #{d[:topic]} draft #{d[:head][0, 7]}, skipped (skip_drafts)"
+            end
+            next
+          end
           case d[:status]
           when :unchanged
             new_state[d[:topic]] = d[:head]
@@ -554,6 +571,7 @@ class ReviewPoll
           end
         end
         new_state['debounce'] = pending unless pending.empty?
+        new_state['drafts'] = drafts unless drafts.empty?
         new_state['commit_review'] = cr if cr
         new_state['hackorum'] = hk_keep if hk_keep
         @state[proj[:name]] = new_state

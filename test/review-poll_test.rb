@@ -94,15 +94,16 @@ class ReviewPollCoreTest < Minitest::Test
       File.write(File.join(bin, 'gh'), <<~SH)
         #!/usr/bin/env bash
         echo "$@" > #{log}
-        echo '[{"number":7,"headRefOid":"aaa","baseRefName":"main"}]'
+        echo '[{"number":7,"headRefOid":"aaa","baseRefName":"main","isDraft":false},{"number":8,"headRefOid":"bbb","baseRefName":"main","isDraft":true}]'
       SH
       FileUtils.chmod(0o755, File.join(bin, 'gh'))
       old = ENV['PATH']
       ENV['PATH'] = "#{bin}:#{old}"
       begin
         prs = poller.open_prs('o/repo')
-        assert_equal [{ number: 7, head: 'aaa', base: 'main' }], prs
-        assert_includes File.read(log), 'number,headRefOid,baseRefName'
+        assert_equal [{ number: 7, head: 'aaa', base: 'main', draft: false },
+                      { number: 8, head: 'bbb', base: 'main', draft: true }], prs
+        assert_includes File.read(log), 'number,headRefOid,baseRefName,isDraft'
       ensure
         ENV['PATH'] = old
       end
@@ -200,6 +201,57 @@ class ReviewPollRunOnceTest < Minitest::Test
                       enqueue: recording_enqueue([]),
                       refresh: recording_refresh([]))
       assert_equal({ 'pr1' => 'aaa' }, poller.state['psp'])
+    end
+  end
+
+  def test_skip_drafts_untracked_until_ready
+    with_poller do |poller|
+      proj = [PROJ.first.merge(skip_drafts: true)]
+      poller.state['psp'] = { 'pr1' => 'aaa' }
+      calls = []
+      out, = capture_io do
+        2.times do # second cycle: same drafts, logged once
+          poller.run_once(projects: proj,
+                          fetch: fetch_returning([{ number: 1, head: 'aaa', draft: true },   # tracked, now draft
+                                                  { number: 2, head: 'bbb', draft: true }]), # new draft
+                          enqueue: recording_enqueue(calls), refresh: recording_refresh([]))
+        end
+      end
+      assert_empty calls
+      assert_equal({ 'drafts' => { 'pr1' => 'aaa', 'pr2' => 'bbb' } }, poller.state['psp'])
+      assert_equal 1, out.scan('pr2 draft bbb, skipped (skip_drafts)').size
+
+      # pr2 marked ready for review without a new push: polled as new
+      poller.run_once(projects: proj,
+                      fetch: fetch_returning([{ number: 1, head: 'aaa', draft: true },
+                                              { number: 2, head: 'bbb', draft: false }]),
+                      enqueue: recording_enqueue(calls), refresh: recording_refresh([]))
+      assert_equal [['psp', 'pr2']], calls
+      assert_equal({ 'pr2' => 'bbb', 'drafts' => { 'pr1' => 'aaa' } }, poller.state['psp'])
+    end
+  end
+
+  def test_drafts_polled_without_skip_drafts
+    with_poller do |poller|
+      poller.state['psp'] = {}
+      calls = []
+      poller.run_once(projects: PROJ,
+                      fetch: fetch_returning([{ number: 2, head: 'bbb', draft: true }]),
+                      enqueue: recording_enqueue(calls), refresh: recording_refresh([]))
+      assert_equal [['psp', 'pr2']], calls
+      assert_equal({ 'pr2' => 'bbb' }, poller.state['psp'])
+    end
+  end
+
+  def test_skip_drafts_baseline_leaves_drafts_untracked
+    with_poller do |poller|
+      calls = []
+      poller.run_once(projects: [PROJ.first.merge(skip_drafts: true)],
+                      fetch: fetch_returning([{ number: 1, head: 'aaa', draft: false },
+                                              { number: 2, head: 'bbb', draft: true }]),
+                      enqueue: recording_enqueue(calls), refresh: recording_refresh([]))
+      assert_empty calls
+      assert_equal({ 'pr1' => 'aaa', 'drafts' => { 'pr2' => 'bbb' } }, poller.state['psp'])
     end
   end
 
@@ -496,6 +548,19 @@ class ReviewPollDebounceTest < Minitest::Test
       end
       got = poller.send(:enabled_projects).to_h { |p| [p[:name], p[:debounce_minutes]] }
       assert_equal({ 'a' => 120, 'b' => 0, 'c' => 0, 'd' => 30 }, got)
+    end
+  end
+
+  def test_enabled_projects_skip_drafts
+    with_poller do |poller|
+      dir = poller.base_dir
+      { 'a' => '', 'b' => "  skip_drafts: true\n", 'c' => "  skip_drafts: yes-ish\n" }.each do |name, extra|
+        FileUtils.mkdir_p(File.join(dir, name))
+        File.write(File.join(dir, name, 'project.yaml'),
+                   "name: #{name}\nbase_branch: main\nsource: o/#{name}\npoll:\n  enabled: true\n#{extra}")
+      end
+      got = poller.send(:enabled_projects).to_h { |p| [p[:name], p[:skip_drafts]] }
+      assert_equal({ 'a' => false, 'b' => true, 'c' => false }, got)
     end
   end
 end

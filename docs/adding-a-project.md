@@ -226,6 +226,10 @@ To re-review only PRs you have already reviewed, add `only_reviewed: true` to th
 A changed or new PR is then enqueued only if `<name>/findings/<topic>/` exists; otherwise its head is recorded and skipped.
 Once you review such a PR by hand (`task enqueue`), its later pushes are polled like any other.
 
+To leave draft PRs alone, add `skip_drafts: true` to the `poll` block.
+A draft's head is not recorded (the poller keeps it under `drafts` in the state only to log it once), so when the PR is marked ready for review it is polled as a new PR, even without a new push.
+A draft can still be reviewed by hand with `task enqueue`.
+
 A changed or new PR is not enqueued right away: the poller waits until its head has stayed the same for `debounce_minutes` (default 120), so a burst of pushes gets one review of the last one.
 A newer push restarts the wait.
 When the wait ends, a PR already in the queue (e.g. enqueued by hand meanwhile) or whose review worktree is already at that head is recorded and not enqueued again.
