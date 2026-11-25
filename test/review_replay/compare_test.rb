@@ -44,6 +44,7 @@ class CompareTest < Minitest::Test
       phases = usage.each_with_index.map do |c, i|
         { 'phase' => "ph#{i}", 'model' => 'opus', 'status' => 'ok', 'cost_usd' => c,
           'tokens' => { 'input' => 1, 'output' => 2, 'cache_read' => 3, 'cache_write' => 4 } }
+          .merge(i.zero? ? { 'agent' => 'codex' } : {})
       end
       File.write(File.join(findings, 'usage.json'), JSON.generate('schema' => 1, 'route' => 'full', 'phases' => phases))
     end
@@ -87,8 +88,15 @@ class CompareTest < Minitest::Test
     t = ReviewReplay::Compare.usage_totals(ReviewReplay::Compare.resolve(@run).findings_dir)
     assert_in_delta 3.5, t['cost_usd']
     assert_equal({ 'input' => 2, 'output' => 4, 'cache_read' => 6, 'cache_write' => 8 }, t['tokens'])
-    assert_equal [{ 'phase' => 'ph0', 'model' => 'opus', 'status' => 'ok', 'cost_usd' => 1.5 },
-                  { 'phase' => 'ph1', 'model' => 'opus', 'status' => 'ok', 'cost_usd' => 2.0 }], t['phases']
+    assert_equal [{ 'phase' => 'ph0', 'model' => 'opus', 'status' => 'ok', 'cost_usd' => 1.5, 'agent' => 'codex' },
+                  { 'phase' => 'ph1', 'model' => 'opus', 'status' => 'ok', 'cost_usd' => 2.0, 'agent' => 'claude' }],
+                 t['phases']
+  end
+
+  def test_usage_totals_cost_nil_without_numeric_cost
+    run = make_run('v2-full-2', usage: [nil, nil])
+    t = ReviewReplay::Compare.usage_totals(ReviewReplay::Compare.resolve(run).findings_dir)
+    assert_nil t['cost_usd']
   end
 
   def test_usage_totals_nil_without_usage

@@ -11,8 +11,10 @@ require_relative '../../lib/review_run/runner'
 class RunnerTest < Minitest::Test
   ROOT = File.expand_path('../..', __dir__)
   FAKE = File.join(ROOT, 'test', 'fixtures', 'review_run', 'fake-claude')
+  FAKE_CODEX = File.join(ROOT, 'test', 'fixtures', 'review_run', 'fake-codex')
   CLI = File.join(ROOT, 'bin', 'review-run')
-  ENV_KEYS = %w[FAKE_CLAUDE_PLAN FAKE_CLAUDE_CALLS REVIEW_DONE_FILE ANTHROPIC_API_KEY TMUX].freeze
+  ENV_KEYS = %w[FAKE_CLAUDE_PLAN FAKE_CLAUDE_CALLS REVIEW_DONE_FILE ANTHROPIC_API_KEY OPENAI_API_KEY CODEX_API_KEY
+                TMUX].freeze
   API_WARNING = 'WARNING: ANTHROPIC_API_KEY is set; claude -p will bill the API key'.freeze
   OUT_REL = 'p/findings/t1/v2'.freeze
 
@@ -68,11 +70,11 @@ class RunnerTest < Minitest::Test
     git('commit', '-q', '-m', 'init')
   end
 
-  def write_manifest(phases)
+  def write_manifest(phases, route: 'full')
     dir = File.join(@ws, '.claude', 'review-phases', 'p')
     FileUtils.mkdir_p(dir)
     phases.each { |ph| File.write(File.join(dir, ph['prompt']), "Do #{ph['name']} for $ARGUMENTS into $OUTDIR\n") }
-    File.write(File.join(dir, 'phases.yaml'), YAML.dump('default_model' => 'opus', 'routes' => { 'full' => phases }))
+    File.write(File.join(dir, 'phases.yaml'), YAML.dump('default_model' => 'opus', 'routes' => { route => phases }))
   end
 
   def default_plan
@@ -94,7 +96,29 @@ class RunnerTest < Minitest::Test
   def runner(sleeper: ->(s) { @slept << s }, clock: -> { Time.now }, **opts)
     @out = StringIO.new
     ReviewRun::Runner.new(base_dir: @base, workspace_dir: @ws, state_dir: @state,
-                          claude_bin: FAKE, out: @out, sleeper: sleeper, clock: clock, **opts)
+                          claude_bin: FAKE, codex_bin: FAKE_CODEX, out: @out, sleeper: sleeper, clock: clock, **opts)
+  end
+
+  def project_yaml(review)
+    File.write(File.join(@ws, 'p', 'project.yaml'),
+               YAML.dump('name' => 'p', 'review' => { 'phases' => 'p' }.merge(review)))
+    git('add', 'p/project.yaml')
+    git('commit', '-q', '-m', 'project.yaml')
+  end
+
+  # previous reviewed version v1; agent nil: no usage.json
+  def prev_usage(agent)
+    dir = File.join(@ws, 'p', 'findings', 't1', 'v1')
+    FileUtils.mkdir_p(dir)
+    File.write(File.join(dir, '05-summary.md'), "x\n")
+    path = File.join(dir, 'usage.json')
+    if agent
+      File.write(path, JSON.generate('phases' => [{ 'phase' => 'a', 'agent' => agent, 'status' => 'ok' }]))
+    else
+      FileUtils.rm_f(path)
+    end
+    git('add', '-A', '--', 'p/findings/t1/v1')
+    git('commit', '-q', '--allow-empty', '-m', 'prev')
   end
 
   def run_topic(**kw)
@@ -159,7 +183,7 @@ class RunnerTest < Minitest::Test
 
     log = usage_log
     assert_equal 3, log.size
-    assert_equal %w[time project topic version route phase model status cost_usd tokens].sort, log[0].keys.sort
+    assert_equal %w[time project topic version route phase agent model status cost_usd tokens].sort, log[0].keys.sort
     assert_equal ['p', 't1', 2, 'full', 'a', 'opus', 'ok'],
                  log[0].values_at('project', 'topic', 'version', 'route', 'phase', 'model', 'status')
     assert_in_delta 0.5, log[0]['cost_usd']
@@ -556,8 +580,9 @@ class RunnerTest < Minitest::Test
     assert_empty calls
   end
 
-  def cli(*args)
-    env = { 'WORKSPACE_DIR' => @ws, 'STATE_DIR' => @state, 'CLAUDE_BIN' => FAKE, 'TMUX' => nil }
+  def cli(*args, env: {})
+    env = { 'WORKSPACE_DIR' => @ws, 'STATE_DIR' => @state, 'CLAUDE_BIN' => FAKE, 'CODEX_BIN' => FAKE_CODEX,
+            'TMUX' => nil }.merge(env)
     Open3.capture2e(env, CLI, *args, chdir: @root)
   end
 
@@ -610,5 +635,675 @@ class RunnerTest < Minitest::Test
     out, st = cli('--replay', 'p', 't1')
     assert st.success?, out
     assert_equal [true, true, true], calls.map { |c| c['replay_note'] }
+  end
+
+  def agents_of(list)
+    list.map { |c| c['agent'] }
+  end
+
+  def reset_run
+    FileUtils.rm_rf(outdir)
+    FileUtils.rm_f(@calls_file)
+  end
+
+  def codex_pause_file
+    File.join(@state, 'paused-codex')
+  end
+
+  def test_default_mode_is_claude_unchanged
+    assert run_topic, output
+    assert_equal %w[claude] * 3, agents_of(calls)
+    assert_equal %w[claude] * 3, agents_of(usage['phases'])
+    assert_equal %w[claude] * 3, agents_of(usage_log)
+    refute usage.key?('codex_version')
+    assert_includes output, 'agent claude (claude)'
+  end
+
+  def test_codex_mode_uses_codex_model_and_effort
+    project_yaml('agent' => 'codex')
+    assert run_topic, output
+    assert_equal %w[codex] * 3, agents_of(calls)
+    calls.each do |c|
+      assert_equal %w[-m gpt-6.2-astra], c['argv'][c['argv'].index('-m'), 2]
+      assert_includes c['argv'], 'model_reasoning_effort=xhigh'
+    end
+    u = usage
+    assert_equal %w[codex] * 3, agents_of(u['phases'])
+    assert_equal %w[gpt-6.2-astra] * 3, u['phases'].map { |p| p['model'] }
+    assert_equal [nil] * 3, u['phases'].map { |p| p['cost_usd'] }
+    assert_equal '9.9.9', u['codex_version']
+    assert_nil u['total']['cost_usd']
+    assert_equal 'codex', u['agent_mode']
+    assert_equal %w[codex] * 3, agents_of(usage_log)
+    assert_equal %w[gpt-6.2-astra] * 3, usage_log.map { |l| l['model'] }
+  end
+
+  def test_claude_model_override
+    project_yaml('claude' => { 'model' => 'haiku' })
+    assert run_topic, output
+    assert_equal %w[haiku] * 3, calls.map { |c| c['argv'][c['argv'].index('--model') + 1] }
+    assert_equal %w[haiku] * 3, usage['phases'].map { |p| p['model'] }
+  end
+
+  def test_alternate_flips_from_previous
+    project_yaml('agent' => 'alternate')
+    { 'claude' => 'codex', 'codex' => 'claude', nil => 'codex' }.each do |prev, want|
+      reset_run
+      prev_usage(prev)
+      assert run_topic, output
+      assert_equal [want] * 3, agents_of(calls), "previous #{prev.inspect}"
+    end
+  end
+
+  def test_alternate_parity_without_previous
+    project_yaml('agent' => 'alternate')
+    assert run_topic, output
+    assert_equal %w[codex] * 3, agents_of(calls)
+    assert_includes output, 'agent codex (alternate)'
+  end
+
+  def test_alternate_resume_keeps_agent
+    project_yaml('agent' => 'alternate')
+    prev_usage('codex')
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('usage.json'), JSON.generate('phases' => [
+                                                     { 'phase' => 'a', 'agent' => 'codex', 'status' => 'failed',
+                                                       'reason' => 'x', 'cost_usd' => nil, 'duration_ms' => 1 }
+                                                   ]))
+    assert run_topic, output
+    assert_equal %w[codex] * 3, agents_of(calls)
+    assert_equal %w[a b c], calls.map { |c| c['phase'] }
+  end
+
+  def test_alternate_switches_on_limit
+    project_yaml('agent' => 'alternate')
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 1 }))
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal %w[codex claude claude claude], agents_of(calls)
+    assert_equal %w[a a b c], calls.map { |c| c['phase'] }
+    assert_empty @slept
+    ph = usage['phases']
+    assert_equal [%w[a codex limit], %w[a claude ok], %w[b claude ok], %w[c claude ok]],
+                 ph.map { |p| p.values_at('phase', 'agent', 'status') }
+    assert_equal 'opus', ph[1]['model']
+    assert File.exist?(codex_pause_file)
+    refute File.exist?(pause_file)
+    assert_includes output, 'usage limit on codex, switching to claude'
+    assert_equal %w[codex claude claude claude], agents_of(usage_log)
+  end
+
+  def test_alternate_both_paused_waits_earlier
+    project_yaml('agent' => 'alternate')
+    ReviewRun::Pause.for(@state, 'claude').set(NOW + 7200, by: 'other')
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 1,
+                                      'limit_text' => "You've hit your usage limit." }))
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [3720], @slept
+    assert_equal %w[codex codex codex codex], agents_of(calls)
+    assert_equal %w[a a b c], calls.map { |c| c['phase'] }
+    refute_includes output, 'switching to'
+    refute File.exist?(codex_pause_file)
+    assert_equal 'other', JSON.parse(File.read(pause_file))['by']
+  end
+
+  def test_alternate_both_paused_other_earlier_runs_on_it
+    project_yaml('agent' => 'alternate')
+    ReviewRun::Pause.for(@state, 'claude').set(NOW + 1800, by: 'other')
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 1,
+                                      'limit_text' => "You've hit your usage limit." }))
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [1800], @slept
+    assert_equal %w[codex claude claude claude], agents_of(calls)
+  end
+
+  def test_claude_mode_never_switches
+    project_yaml('agent' => 'claude')
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 1 }))
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal 1, @slept.size
+    assert_equal %w[claude] * 4, agents_of(calls)
+    refute File.exist?(codex_pause_file)
+  end
+
+  def test_forced_agent
+    assert run_topic(agent: 'codex'), output
+    assert_equal %w[codex] * 3, agents_of(calls)
+    assert_includes output, 'agent codex (claude, forced)'
+
+    reset_run
+    project_yaml('agent' => 'alternate')
+    prev_usage('codex')
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 1 }))
+    assert run_topic(agent: 'codex', clock: -> { NOW }), output
+    assert_equal %w[codex] * 4, agents_of(calls)
+    assert_equal 1, @slept.size
+    refute_includes output, 'switching to'
+  end
+
+  def test_codex_missing_fails_cleanly
+    project_yaml('agent' => 'codex')
+    refute run_topic(codex_bin: '/nonexistent/codex')
+    assert_includes output, 'ERROR: could not run /nonexistent/codex'
+    refute_includes output, 'Errno'
+    assert_equal ['failed', 'no result event (codex did not start)'], usage['phases'].last.values_at('status', 'reason')
+    refute usage.key?('codex_version')
+
+    done = File.join(@root, 'p-t1.done')
+    out, st = cli('--done-file', done, 'p', 't1', env: { 'CODEX_BIN' => '/nonexistent/codex' })
+    refute st.success?, out
+    assert_includes out, 'could not run /nonexistent/codex'
+    assert File.exist?(done)
+  end
+
+  def test_codex_unparseable_reset_waits_fallback
+    project_yaml('agent' => 'codex')
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 1,
+                                      'limit_text' => "You've hit your usage limit." }))
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [3720], @slept
+    assert_equal %w[codex] * 4, agents_of(calls)
+    assert_equal %w[limit ok ok ok], usage['phases'].map { |p| p['status'] }
+    refute File.exist?(codex_pause_file)
+  end
+
+  def test_long_limit_notifies_in_single_mode
+    path = ENV['PATH']
+    stub = File.join(@root, 'stub-bin')
+    rec = File.join(@root, 'tmux.args')
+    FileUtils.mkdir_p(stub)
+    File.write(File.join(stub, 'tmux'), "#!/bin/sh\necho \"$@\" >> #{rec}\n")
+    File.chmod(0o755, File.join(stub, 'tmux'))
+    ENV['PATH'] = "#{stub}:#{path}"
+    ENV['TMUX'] = 'fake'
+    reset = (NOW + (3 * 86_400)).to_i
+    plan(default_plan.merge('a' => { 'write' => ['a.md'], 'limit_times' => 2,
+                                      'limit_event' => LIMIT_EVENT.merge('resetsAt' => reset) }))
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal 2, @slept.size
+    windows = File.readlines(rec)
+    assert_equal 1, windows.size, windows.join
+    assert_includes windows.first, '-n LIMIT-claude '
+    assert_includes windows.first, 'claude\ usage\ limit\ until'
+  ensure
+    ENV['PATH'] = path
+  end
+
+  def test_short_limit_does_not_notify
+    r = runner(clock: -> { NOW })
+    seen = []
+    r.define_singleton_method(:notify) { |w, _m| seen << w }
+    limit_plan('limit_first' => true)
+    ok = nil
+    capture_io { ok = r.run_topic(project: 'p', topic: 't1') }
+    assert ok, output
+    assert_empty seen
+  end
+
+  def test_bad_agent_config_fails
+    project_yaml('agent' => 'both')
+    refute run_topic
+    assert_includes output, 'review.agent'
+    assert_empty calls
+  end
+
+  def test_warns_on_codex_key
+    ENV['OPENAI_API_KEY'] = 'sk-test'
+    assert run_topic, output
+    refute_includes output, 'OPENAI_API_KEY'
+    reset_run
+    project_yaml('agent' => 'alternate')
+    assert run_topic, output
+    assert_includes output, 'WARNING: OPENAI_API_KEY/CODEX_API_KEY is set; codex exec may bill the API key'
+  end
+
+  def test_codex_without_result_has_no_cost
+    project_yaml('agent' => 'codex')
+    refute run_topic(codex_bin: '/nonexistent/codex')
+    u = usage
+    assert_nil u['phases'].last['cost_usd']
+    assert_nil u['total']['cost_usd']
+    assert_equal [nil], usage_log.map { |l| l['cost_usd'] }
+  end
+
+  def test_cli_agent_flag
+    out, st = cli('--agent', 'codex', 'p', 't1')
+    assert st.success?, out
+    assert_equal %w[codex] * 3, agents_of(calls)
+    out, st = cli('--agent', 'gemini', 'p', 't1')
+    refute st.success?
+    assert_includes out, 'invalid argument'
+  end
+
+  def both_setup(review = {})
+    write_manifest([{ 'name' => 'review', 'prompt' => '01-review.md', 'output' => '05-summary.md' }], route: 'single')
+    project_yaml({ 'route' => 'single', 'agent' => 'both' }.merge(review))
+    both_plan
+  end
+
+  def both_plan(steps = {})
+    plan({ 'discovery' => { 'write' => %w[01-design-review.md 02-code-review.md], 'commit' => false },
+           'review' => { 'write' => ['05-summary.md'] } }.merge(steps))
+  end
+
+  def phase_agents
+    calls.map { |c| c.values_at('phase', 'agent') }
+  end
+
+  def usage_rows(*keys)
+    usage['phases'].map { |p| p.values_at('phase', 'agent', 'status', *keys) }
+  end
+
+  def test_both_runs_discovery_then_primary
+    both_setup
+    r = runner
+    prompts = []
+    r.define_singleton_method(:run_session) do |rv, phase, prompt, log, usage|
+      prompts << prompt
+      super(rv, phase, prompt, log, usage)
+    end
+    ok = nil
+    capture_io { ok = r.run_topic(project: 'p', topic: 't1') }
+    assert ok, output
+    assert_equal [%w[discovery codex], %w[review claude]], phase_agents
+    d, rev = calls
+    assert_equal "#{OUT_REL}/codex", d['outdir']
+    assert d['discovery_note']
+    refute d['note']
+    assert_equal OUT_REL, rev['outdir']
+    assert rev['note']
+    refute rev['discovery_note']
+    assert_includes prompts[0], "Do review for t1 into #{OUT_REL}/codex\n"
+    assert_includes prompts[0], ReviewRun::Prompt::DISCOVERY_NOTE
+    assert_includes prompts[1], ReviewRun::Prompt.primary_note("#{OUT_REL}/codex")
+    prompts.each { |pr| assert_includes pr, "\nRun without stopping for user input.\n" }
+
+    assert_equal %W[#{OUT_REL}/codex/01-design-review.md #{OUT_REL}/codex/02-code-review.md],
+                 git('ls-files', "#{OUT_REL}/codex").lines.map(&:strip)
+    assert_includes git('log', '--format=%s'), 'review(t1): codex discovery (runner)'
+    assert_equal '', dirty('p/findings')
+    u = usage
+    assert_equal [%w[discovery codex ok gpt-6.2-astra], %w[review claude ok opus]], usage_rows('model')
+    assert_equal 'both', u['agent_mode']
+    refute u.key?('degraded')
+    refute u.key?('discovery_base')
+    assert_equal %w[01-discovery.jsonl 02-review.jsonl], Dir.children(File.join(@state, 'logs', 'p-t1-v2')).sort
+    assert_includes output, 'agent claude (both, discovery on codex)'
+    assert_includes output, '=== phase discovery (1 of 2), agent codex'
+  end
+
+  def test_both_primary_codex
+    both_setup('primary' => 'codex')
+    assert run_topic, output
+    assert_equal [%w[discovery claude], %w[review codex]], phase_agents
+    assert_equal "#{OUT_REL}/claude", calls[0]['outdir']
+    assert calls[1]['note']
+    assert_equal '', dirty("#{OUT_REL}/claude")
+    assert_includes git('log', '--format=%s'), 'review(t1): claude discovery (runner)'
+  end
+
+  def test_both_guard_fails_on_stray_write
+    both_setup
+    stray = "#{OUT_REL}/02-code-review.md"
+    both_plan('discovery' => { 'write' => ['02-code-review.md'], 'files' => { File.join(@ws, stray) => 'x' } })
+    refute run_topic
+    assert_equal %w[discovery], calls.map { |c| c['phase'] }
+    msg = "discovery wrote outside #{OUT_REL}/codex: #{stray}"
+    assert_includes output, msg
+    assert_equal [['discovery', 'codex', 'failed', msg]], usage_rows('reason')
+    assert File.exist?(File.join(@ws, stray))
+  end
+
+  def test_both_guard_catches_committed_stray
+    both_setup
+    stray = "#{OUT_REL}/00-overview.md"
+    both_plan('discovery' => { 'write' => ['02-code-review.md'], 'files' => { File.join(@ws, stray) => 'x' },
+                               'commit_files' => true })
+    refute run_topic
+    assert_includes output, "discovery wrote outside #{OUT_REL}/codex: #{stray}"
+    assert_equal '', dirty(stray)
+  end
+
+  def test_both_guard_ignores_other_commits_and_existing_files
+    both_setup
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('old.md'), "old\n")
+    git('add', "#{OUT_REL}/old.md")
+    git('commit', '-q', '-m', 'old')
+    other = 'p/findings/t2/v1/x.md'
+    both_plan('discovery' => { 'write' => ['02-code-review.md'], 'files' => { File.join(@ws, other) => 'x' },
+                               'commit_files' => true })
+    assert run_topic, output
+    assert_equal %w[discovery review], calls.map { |c| c['phase'] }
+    assert_equal '', dirty(other)
+    assert_includes git('log', '--format=%s'), 'fake discovery files'
+  end
+
+  def test_both_resume_skips_discovery
+    both_setup
+    both_plan('review' => { 'write' => ['05-summary.md'], 'exit' => 1 })
+    refute run_topic
+    assert_equal %w[discovery review], calls.map { |c| c['phase'] }
+
+    both_plan
+    assert run_topic, output
+    assert_equal %w[discovery review review], calls.map { |c| c['phase'] }
+    assert calls.last['note']
+    assert_includes output, 'skip discovery: codex/02-code-review.md exists'
+    assert_equal %w[ok failed ok], usage['phases'].map { |p| p['status'] }
+  end
+
+  def test_both_discovery_long_limit_skips
+    both_setup
+    ReviewRun::Pause.for(@state, 'codex').set(NOW + (3 * 86_400), by: 'other')
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [%w[review claude]], phase_agents
+    refute calls.first['note']
+    assert_empty @slept
+    assert_equal [['discovery', 'codex', 'skipped', 'usage limit (long)'], ['review', 'claude', 'ok', nil]],
+                 usage_rows('reason')
+    assert_equal true, usage['degraded']
+    refute usage.key?('discovery_base')
+  end
+
+  def test_both_resume_after_skipped_discovery
+    both_setup
+    ReviewRun::Pause.for(@state, 'codex').set(NOW + (3 * 86_400), by: 'other')
+    both_plan('review' => { 'write' => ['05-summary.md'], 'exit' => 1 })
+    refute run_topic(clock: -> { NOW })
+    assert_equal [%w[discovery codex skipped], %w[review claude failed]], usage_rows
+
+    ReviewRun::Pause.for(@state, 'codex').clear
+    FileUtils.mkdir_p(outdir('codex'))
+    File.write(outdir('codex', '02-code-review.md'), "partial\n")
+    both_plan
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [%w[review claude], %w[review claude]], phase_agents
+    assert_includes output, 'skip discovery: skipped earlier'
+    refute calls.last['note']
+    assert_equal true, usage['degraded']
+  end
+
+  def test_both_stray_of_failed_discovery_never_accepted
+    both_setup
+    stray = "#{OUT_REL}/05-summary.md"
+    msg = "discovery wrote outside #{OUT_REL}/codex: #{stray}"
+    both_plan('discovery' => { 'write' => [], 'files' => { File.join(@ws, stray) => 'codex summary' },
+                               'commit_files' => true })
+    refute run_topic
+    assert_includes output, "FAILED: phase discovery: #{msg}"
+    assert_equal [['discovery', 'codex', 'failed', msg]], usage_rows('reason')
+    assert usage['discovery_base']
+
+    both_plan
+    refute run_topic
+    assert_includes output, "FAILED: phase discovery: #{msg}"
+    refute_includes output, 'skip review'
+    assert_equal %w[discovery discovery], calls.map { |c| c['phase'] }
+
+    git('rm', '-q', stray)
+    git('commit', '-q', '-m', 'drop stray')
+    assert run_topic, output
+    assert_equal [%w[discovery codex]] * 3 + [%w[review claude]], phase_agents
+    refute usage.key?('discovery_base')
+  end
+
+  def test_both_guard_runs_on_session_failure
+    both_setup
+    stray = "#{OUT_REL}/00-overview.md"
+    both_plan('discovery' => { 'write' => ['02-code-review.md'], 'exit' => 1,
+                               'files' => { File.join(@ws, stray) => 'x' } })
+    refute run_topic
+    msg = "discovery wrote outside #{OUT_REL}/codex: #{stray}"
+    assert_includes output, "FAILED: phase discovery: #{msg}"
+    assert_equal [['discovery', 'codex', 'failed', msg]], usage_rows('reason')
+  end
+
+  def test_both_guard_runs_before_long_skip
+    both_setup
+    base = git('rev-parse', 'HEAD').strip
+    stray = "#{OUT_REL}/05-summary.md"
+    FileUtils.mkdir_p(outdir)
+    File.write(File.join(@ws, stray), "codex summary\n")
+    git('add', stray)
+    git('commit', '-q', '-m', 'stray of a killed discovery')
+    File.write(outdir('usage.json'), JSON.generate('discovery_base' => base, 'phases' => [
+                                                     { 'phase' => 'discovery', 'agent' => 'codex', 'status' => 'limit',
+                                                       'cost_usd' => nil, 'duration_ms' => 1 }
+                                                   ]))
+    ReviewRun::Pause.for(@state, 'codex').set(NOW + (3 * 86_400), by: 'other')
+    refute run_topic(clock: -> { NOW })
+    assert_empty calls
+    assert_includes output, "FAILED: phase discovery: discovery wrote outside #{OUT_REL}/codex: #{stray}"
+    refute_includes output, 'discovery skipped'
+    assert_equal %w[limit failed], usage['phases'].map { |p| p['status'] }
+    refute usage.key?('degraded')
+  end
+
+  def test_both_base_gone_from_history_starts_over
+    both_setup
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('usage.json'), JSON.generate('discovery_base' => 'f' * 40, 'phases' => []))
+    assert run_topic, output
+    assert_includes output, 'WARNING: discovery base ffffffffffff not in history, guard starts from HEAD'
+    assert_equal %w[discovery review], calls.map { |c| c['phase'] }
+    refute usage.key?('discovery_base')
+  end
+
+  def test_both_discovery_long_limit_hit_skips
+    both_setup
+    both_plan('discovery' => { 'write' => ['02-code-review.md'], 'limit_times' => 1,
+                               'limit_text' => "You've hit your usage limit. Try again in 3 days." })
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [%w[discovery codex], %w[review claude]], phase_agents
+    refute calls.last['note']
+    assert_empty @slept
+    assert_equal [%w[discovery codex limit], %w[discovery codex skipped], %w[review claude ok]], usage_rows
+    assert_equal true, usage['degraded']
+    assert File.exist?(codex_pause_file)
+  end
+
+  def test_both_discovery_short_limit_waits
+    both_setup
+    both_plan('discovery' => { 'write' => ['02-code-review.md'], 'limit_times' => 1,
+                               'limit_text' => "You've hit your usage limit. Try again in 1 hour." })
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [3720], @slept
+    assert_equal [%w[discovery codex], %w[discovery codex], %w[review claude]], phase_agents
+    assert calls.last['note']
+    assert_equal [%w[discovery codex limit], %w[discovery codex ok], %w[review claude ok]], usage_rows
+    refute usage.key?('degraded')
+    refute File.exist?(codex_pause_file)
+  end
+
+  def test_both_primary_long_limit_runs_on_other
+    both_setup
+    reset = (NOW + (3 * 86_400)).to_i
+    both_plan('review' => { 'write' => ['05-summary.md'], 'limit_times' => 1, 'limit_agent' => 'claude',
+                            'limit_event' => LIMIT_EVENT.merge('resetsAt' => reset, 'rateLimitType' => 'seven_day') })
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [%w[discovery codex], %w[review claude], %w[review codex]], phase_agents
+    assert calls[1]['note']
+    refute calls[2]['note']
+    assert_empty @slept
+    assert_equal [%w[discovery codex ok], %w[review claude limit], %w[review codex ok]], usage_rows
+    assert_equal true, usage['degraded']
+    assert_includes output, 'primary claude long-limited, review runs on codex alone'
+    assert File.exist?(pause_file)
+  end
+
+  def test_both_primary_long_paused_at_start_runs_on_other
+    both_setup
+    ReviewRun::Pause.for(@state, 'claude').set(NOW + (3 * 86_400), by: 'other')
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [%w[discovery codex], %w[review codex]], phase_agents
+    refute calls.last['note']
+    assert_equal true, usage['degraded']
+  end
+
+  def test_both_all_long_waits_for_earlier
+    both_setup
+    ReviewRun::Pause.for(@state, 'claude').set(NOW + (3 * 86_400), by: 'other')
+    ReviewRun::Pause.for(@state, 'codex').set(NOW + (2 * 86_400), by: 'other')
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [2 * 86_400], @slept
+    assert_equal [%w[review codex]], phase_agents
+    refute calls.last['note']
+    assert_equal [%w[discovery codex skipped], %w[review codex ok]], usage_rows
+    assert_equal true, usage['degraded']
+  end
+
+  def test_both_short_primary_limit_waits
+    both_setup
+    both_plan('review' => { 'write' => ['05-summary.md'], 'limit_times' => 1, 'limit_agent' => 'claude',
+                            'limit_event' => LIMIT_EVENT })
+    assert run_topic(clock: -> { NOW }), output
+    assert_equal [1120], @slept
+    assert_equal [%w[discovery codex], %w[review claude], %w[review claude]], phase_agents
+    assert calls.last['note']
+    refute usage.key?('degraded')
+  end
+
+  def test_forced_agent_in_both_mode_runs_single
+    both_setup
+    assert run_topic(agent: 'claude'), output
+    assert_equal [%w[review claude]], phase_agents
+    assert_equal OUT_REL, calls.first['outdir']
+    refute calls.first['note']
+    refute calls.first['discovery_note']
+    assert_equal %w[review], usage['phases'].map { |p| p['phase'] }
+  end
+
+  def test_both_needs_one_phase_route
+    write_manifest(PHASES, route: 'single')
+    project_yaml('route' => 'single', 'agent' => 'both')
+    refute run_topic
+    assert_includes output, 'review.agent both needs a one-phase route'
+    assert_empty calls
+    refute File.exist?(outdir)
+  end
+
+  def test_both_guard_reads_git_stdout_only
+    both_setup
+    path = ENV['PATH']
+    real = path.split(File::PATH_SEPARATOR).map { |d| File.join(d, 'git') }.find { |f| File.executable?(f) }
+    stub = File.join(@root, 'git-bin')
+    FileUtils.mkdir_p(stub)
+    File.write(File.join(stub, 'git'), <<~SH)
+      #!/bin/sh
+      case " $* " in *' -z '*|' rev-parse '*) echo 'warning: noise' >&2 ;; esac
+      exec #{real} "$@"
+    SH
+    File.chmod(0o755, File.join(stub, 'git'))
+    ENV['PATH'] = "#{stub}:#{path}"
+    assert run_topic, output
+    assert_equal %w[discovery review], calls.map { |c| c['phase'] }
+  ensure
+    ENV['PATH'] = path
+  end
+
+  def test_both_guard_exempts_preexisting_dirt
+    both_setup
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('old.md'), "old\n")
+    git('add', "#{OUT_REL}/old.md")
+    git('commit', '-q', '-m', 'old')
+    File.write(outdir('old.md'), "edited\n")
+    File.write(outdir('discussion.txt'), "thread\n")
+    assert run_topic, output
+    assert_equal [%w[discovery codex], %w[review claude]], phase_agents
+    refute File.exist?(outdir('codex', 'discussion.txt'))
+    refute usage.key?('discovery_dirty')
+  end
+
+  def test_both_dirt_recorded_once_per_discovery
+    both_setup
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('discussion.txt'), "thread\n")
+    stray = "#{OUT_REL}/00-overview.md"
+    msg = "discovery wrote outside #{OUT_REL}/codex: #{stray}"
+    both_plan('discovery' => { 'write' => ['02-code-review.md'], 'files' => { File.join(@ws, stray) => 'x' } })
+    refute run_topic
+    assert_includes output, msg
+    assert_equal ["#{OUT_REL}/discussion.txt"], usage['discovery_dirty']
+
+    both_plan
+    refute run_topic
+    assert_includes output, "FAILED: phase discovery: #{msg}"
+
+    FileUtils.rm_f(File.join(@ws, stray))
+    assert run_topic, output
+    assert_equal %w[discovery discovery discovery review], calls.map { |c| c['phase'] }
+    refute usage.key?('discovery_dirty')
+  end
+
+  def test_both_replay_discovery_gets_discussion
+    both_setup
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('discussion.txt'), "thread\n")
+    copy = outdir('codex', 'discussion.txt')
+    r = runner(replay: true)
+    seen = []
+    r.define_singleton_method(:run_session) do |rv, phase, prompt, log, usage|
+      seen << [phase.name, File.exist?(copy) && File.read(copy)]
+      super(rv, phase, prompt, log, usage)
+    end
+    ok = nil
+    capture_io { ok = r.run_topic(project: 'p', topic: 't1') }
+    assert ok, output
+    assert_equal [['discovery', "thread\n"], ['review', "thread\n"]], seen
+    assert calls.first['replay_note']
+    assert_includes git('ls-files', "#{OUT_REL}/codex"), "#{OUT_REL}/codex/discussion.txt"
+    assert_equal '', dirty("#{OUT_REL}/codex")
+  end
+
+  def test_both_replay_long_limited_discovery_skips
+    both_setup
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('discussion.txt'), "thread\n")
+    ReviewRun::Pause.for(@state, 'codex').set(NOW + (3 * 86_400), by: 'other')
+    assert run_topic(replay: true, clock: -> { NOW }), output
+    assert_equal [%w[review claude]], phase_agents
+    refute File.exist?(outdir('codex'))
+  end
+
+  def test_both_skipped_discovery_commits_subdir
+    both_setup
+    both_plan('discovery' => { 'write' => ['02-code-review.md'], 'limit_times' => 1,
+                               'limit_text' => "You've hit your usage limit. Try again in 3 days." })
+    partial = outdir('codex', '00-overview.md')
+    r = runner(clock: -> { NOW })
+    r.define_singleton_method(:run_session) do |rv, phase, prompt, log, usage|
+      if phase.name == 'discovery'
+        FileUtils.mkdir_p(File.dirname(partial))
+        File.write(partial, "partial\n")
+      end
+      super(rv, phase, prompt, log, usage)
+    end
+    ok = nil
+    capture_io { ok = r.run_topic(project: 'p', topic: 't1') }
+    assert ok, output
+    assert_equal [%w[discovery codex limit], %w[discovery codex skipped], %w[review claude ok]], usage_rows
+    assert_equal "#{OUT_REL}/codex/00-overview.md\n", git('ls-files', "#{OUT_REL}/codex")
+    assert_equal '', dirty('p/findings')
+  end
+
+  def test_both_skips_discovery_when_review_done
+    both_setup
+    FileUtils.mkdir_p(outdir)
+    File.write(outdir('05-summary.md'), "done\n")
+    git('add', "#{OUT_REL}/05-summary.md")
+    git('commit', '-q', '-m', 'finished')
+    assert run_topic, output
+    assert_empty calls
+    assert_includes output, 'skip discovery: review: 05-summary.md exists'
+    refute File.exist?(outdir('codex'))
+    refute File.exist?(outdir('usage.json'))
+  end
+
+  def test_forced_agent_skips_both_route_rule
+    project_yaml('agent' => 'both')
+    assert run_topic(agent: 'claude'), output
+    assert_equal [%w[a claude], %w[b claude], %w[c claude]], phase_agents
+    assert_includes runner.render(project: 'p', topic: 't1', phase: 'a'), "Do a for t1 into #{OUT_REL}\n"
   end
 end

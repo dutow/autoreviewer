@@ -140,6 +140,157 @@ class UsageTest < Minitest::Test
     end
   end
 
+  CodexResult = Struct.new(:duration_ms, :num_turns, :cost_usd, :session_id, :tokens, :models)
+
+  def codex_result
+    CodexResult.new(500, 2, nil, 'thr-1',
+                    { 'input' => 7, 'output' => 3, 'cache_read' => 1, 'cache_write' => 0 },
+                    { 'gpt-x' => { 'input' => 7, 'cost_usd' => nil } })
+  end
+
+  def new_usage(path, **kw)
+    ReviewRun::Usage.new(path: path, route: 'single', claude_version: '1', **kw)
+  end
+
+  def test_entry_records_agent
+    with_path do |path|
+      u = new_usage(path)
+      u.add(phase: 'a', model: 'opus', result: result(1.0, 100, 1), started_at: T0)
+      u.add(phase: 'b', model: 'gpt-x', result: codex_result, started_at: T0, agent: 'codex')
+      u.write
+      a, b = load_json(path)['phases']
+      assert_equal 'claude', a['agent']
+      assert_equal 'codex', b['agent']
+      assert_nil b['cost_usd']
+    end
+  end
+
+  def test_skip_entry
+    with_path do |path|
+      u = new_usage(path)
+      u.skip(phase: 'a', agent: 'codex', reason: 'paused', started_at: T0)
+      assert u.changed?
+      u.write
+      e = load_json(path)['phases'][0]
+      assert_equal 'skipped', e['status']
+      assert_equal 'codex', e['agent']
+      assert_equal 'paused', e['reason']
+      assert_nil e['cost_usd']
+      assert_equal 0, e['tokens']['input']
+      assert_nil load_json(path)['total']['cost_usd']
+    end
+  end
+
+  def test_total_cost_nil_for_codex_only
+    with_path do |path|
+      u = new_usage(path)
+      u.add(phase: 'a', model: 'gpt-x', result: codex_result, started_at: T0, agent: 'codex')
+      u.write
+      d = load_json(path)
+      assert_nil d['total']['cost_usd']
+      assert_equal 7, d['total']['tokens']['input']
+    end
+  end
+
+  def test_total_cost_mixed_sums_numeric_only
+    with_path do |path|
+      u = new_usage(path)
+      u.add(phase: 'a', model: 'opus', result: result(1.5, 100, 1), started_at: T0)
+      u.add(phase: 'b', model: 'gpt-x', result: codex_result, started_at: T0, agent: 'codex')
+      u.write
+      assert_equal 1.5, load_json(path)['total']['cost_usd']
+    end
+  end
+
+  def test_last_agent
+    with_path do |path|
+      u = new_usage(path)
+      assert_nil u.last_agent
+      u.add(phase: 'a', model: 'opus', result: result(1.0, 100, 1), started_at: T0)
+      u.add(phase: 'b', model: 'gpt-x', result: codex_result, started_at: T0, agent: 'codex')
+      assert_equal 'codex', u.last_agent
+      assert_equal 'claude', u.last_agent('a')
+      assert_equal 'codex', u.last_agent('b')
+      assert_nil u.last_agent('c')
+    end
+  end
+
+  def test_last_agent_old_entry_defaults_to_claude
+    with_path do |path|
+      File.write(path, JSON.generate('phases' => [{ 'phase' => 'a', 'status' => 'ok' }]))
+      assert_equal 'claude', new_usage(path).last_agent
+    end
+  end
+
+  def test_review_agent
+    with_path do |path|
+      assert_nil ReviewRun::Usage.review_agent(path)
+      File.write(path, JSON.generate('phases' => [{ 'phase' => 'a', 'status' => 'ok' }]))
+      assert_equal 'claude', ReviewRun::Usage.review_agent(path)
+      File.write(path, 'garbage{')
+      assert_nil ReviewRun::Usage.review_agent(path)
+      File.write(path, JSON.generate('phases' => [
+        { 'phase' => 'a', 'status' => 'ok', 'agent' => 'claude' },
+        { 'phase' => 'b', 'status' => 'ok', 'agent' => 'codex' },
+        { 'phase' => 'c', 'status' => 'failed', 'agent' => 'claude' }
+      ]))
+      assert_equal 'codex', ReviewRun::Usage.review_agent(path)
+    end
+  end
+
+  def test_agent_metadata_survives_reload
+    with_path do |path|
+      u = new_usage(path, agent_mode: 'alternate')
+      u.set_version('codex', '0.171.0')
+      u.degraded!
+      u.write
+      d = load_json(path)
+      assert_equal 'alternate', d['agent_mode']
+      assert_equal '0.171.0', d['codex_version']
+      assert_equal true, d['degraded']
+      new_usage(path).write
+      d = load_json(path)
+      assert_equal 'alternate', d['agent_mode']
+      assert_equal '0.171.0', d['codex_version']
+      assert_equal true, d['degraded']
+    end
+  end
+
+  def test_metadata_absent_when_unset
+    with_path do |path|
+      new_usage(path).write
+      d = load_json(path)
+      %w[agent_mode codex_version degraded discovery_base].each { |k| refute d.key?(k), k }
+    end
+  end
+
+  def test_discovery_base_survives_reload
+    with_path do |path|
+      u = new_usage(path)
+      u.discovery_base = 'abc123'
+      u.write
+      assert_equal 'abc123', new_usage(path).discovery_base
+      u.discovery_base = nil
+      u.write
+      refute load_json(path).key?('discovery_base')
+      assert_nil new_usage(path).discovery_base
+    end
+  end
+
+  def test_discovery_dirty_kept_with_base
+    with_path do |path|
+      u = new_usage(path)
+      u.discovery_base = 'abc123'
+      u.discovery_dirty = ['p/x.txt']
+      u.write
+      assert_equal ['p/x.txt'], new_usage(path).discovery_dirty
+      u.discovery_base = nil
+      u.write
+      refute load_json(path).key?('discovery_dirty')
+      assert_nil new_usage(path).discovery_dirty
+    end
+  end
+
   def test_append_log_writes_jsonl
     Dir.mktmpdir do |d|
       log = File.join(d, 'sub', 'usage.log')

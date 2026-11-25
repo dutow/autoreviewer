@@ -20,21 +20,16 @@ The topic to review is: `$ARGUMENTS`
    - `version` -> this is the version number (NN)
    - `source_url` -> mailing list thread URL
    - `topic` -> canonical topic id
-4. Set the output directory:
-   - **If `postgres/current-reviews/$ARGUMENTS` exists as a symlink**, the orchestrator has already created and reserved the output directory for you.
-     Resolve the symlink and use its target as the output directory -- do NOT recompute the version number or pick a different directory.
-     This is the authoritative path; using it avoids numbering drift.
-   - **Otherwise** (running this command manually), set the output directory to `postgres/findings/$ARGUMENTS/v{version}/`, then create a relative symlink `postgres/current-reviews/$ARGUMENTS` -> `../findings/$ARGUMENTS/v{version}` so the active review is tracked under `postgres/current-reviews/` (create `postgres/current-reviews/` if it does not exist).
-
-   In the steps below, "the output directory" refers to whichever path you resolved here.
+4. The output directory is `$OUTDIR` (relative to the workspace root); the runner created it. Use it verbatim -- do NOT recompute the version number or pick a different directory.
+   If the path in the previous sentence is still a dollar-sign placeholder (this command was run by hand, not by the runner): resolve the `postgres/current-reviews/$ARGUMENTS` symlink if it exists, otherwise use `postgres/findings/$ARGUMENTS/v{version}/` and create the relative symlink `postgres/current-reviews/$ARGUMENTS` -> `../findings/$ARGUMENTS/v{version}`. Read every `$OUTDIR` below as that directory.
 
 ### Step 2: Initialize Output Directory
 
 1. Create the output directory and subdirectories (the directory itself may already exist and be empty -- that is expected):
    ```
-   <output directory>/
-   <output directory>/patches/
-   <output directory>/tests/
+   $OUTDIR/
+   $OUTDIR/patches/
+   $OUTDIR/tests/
    ```
 2. Copy all `.patch` and `.diff` files from `postgres/review/$ARGUMENTS/.hackorum/` to the `patches/` subdirectory
 3. Check for previous versions: look for other `v*/` directories in `postgres/findings/$ARGUMENTS/` -- note the highest previous version path if it exists
@@ -43,7 +38,7 @@ The topic to review is: `$ARGUMENTS`
 
 ### Step 3: Fetch Mailing List Discussion
 
-Use WebFetch to download the `source_url` page and save the FULL content to `postgres/findings/$ARGUMENTS/v{version}/discussion.txt`.
+Use WebFetch to download the `source_url` page and save the FULL content to `$OUTDIR/discussion.txt`.
 
 **CRITICAL**: The mailing list thread may be very long.
 You MUST save the complete fetched content to the file.
@@ -59,7 +54,7 @@ If tests failed, also read the relevant test logs from `postgres/builds/$ARGUMEN
 ### Step 5: Initial Commit
 
 ```
-git add postgres/findings/$ARGUMENTS/v{version}/
+git add $OUTDIR/
 git commit -m "review($ARGUMENTS): initialize v{version} review"
 ```
 
@@ -172,7 +167,7 @@ For each finding:
    Criteria (guidance, not a formula): diff size, number of subsystems touched, new abstractions or on-disk/protocol changes, controversy in the discussion.
    Also note whether this is the first reviewed version (no previous `v*` findings directory exists).
 
-Write `postgres/findings/$ARGUMENTS/v{version}/00-overview.md`:
+Write `$OUTDIR/00-overview.md`:
 
 ```markdown
 # Patch Overview: $ARGUMENTS v{version}
@@ -227,7 +222,7 @@ which mailing list concerns were addressed]
 touched, new abstractions or on-disk/protocol changes, discussion controversy.]
 ```
 
-Commit: `git add postgres/findings/$ARGUMENTS/ && git commit -m "review($ARGUMENTS): add patch overview"`
+Commit: `git add $OUTDIR/ && git commit -m "review($ARGUMENTS): add patch overview"`
 
 ---
 
@@ -258,7 +253,7 @@ Scale this phase to the complexity classification from Phase 1:
 The fenced template below shows the full MODERATE/COMPLEX form.
 For TRIVIAL patches, emit only the three-section short note described above -- do not fill in the omitted sections.
 
-Write `postgres/findings/$ARGUMENTS/v{version}/01-design-review.md`:
+Write `$OUTDIR/01-design-review.md`:
 
 ```markdown
 # Design Review: $ARGUMENTS v{version}
@@ -296,7 +291,7 @@ Are there missing pieces that should be included?]
 These are issues that can't be fixed by editing code -- they require rethinking the approach.]
 ```
 
-Commit: `git add postgres/findings/$ARGUMENTS/ && git commit -m "review($ARGUMENTS): add design review"`
+Commit: `git add $OUTDIR/ && git commit -m "review($ARGUMENTS): add design review"`
 
 ---
 
@@ -342,7 +337,7 @@ A coverage observation that names a concrete but unverified failure may be recor
 "What NOT to flag" takes precedence over NITPICK: if an observation matches the list above, omit it entirely -- do not record it as a NITPICK finding.
 NITPICK is for observations that clear this bar but still fall below the posting bar.
 
-Write `postgres/findings/$ARGUMENTS/v{version}/02-code-review.md`:
+Write `$OUTDIR/02-code-review.md`:
 
 ```markdown
 # Code Review: $ARGUMENTS v{version}
@@ -370,7 +365,7 @@ Write `postgres/findings/$ARGUMENTS/v{version}/02-code-review.md`:
 [... repeat for each finding ...]
 ```
 
-Commit: `git add postgres/findings/$ARGUMENTS/ && git commit -m "review($ARGUMENTS): add code review findings"`
+Commit: `git add $OUTDIR/ && git commit -m "review($ARGUMENTS): add code review findings"`
 
 ---
 
@@ -487,7 +482,7 @@ After all validation subagents complete:
 1. Collect all validation results
 2. For WITHDRAWN findings: note them briefly at the end (title + reason withdrawn)
 3. For CONFIRMED and DOWNGRADED findings: update the finding with validation evidence
-4. Save any test files to `postgres/findings/$ARGUMENTS/v{version}/tests/`
+4. Save any test files to `$OUTDIR/tests/`
 5. Classify post-worthiness for every surviving finding -- Confirmed, Downgraded, and the Trivial bucket that skipped validation (this is where low-value findings currently escape review); Withdrawn findings are not classified:
    - **POST** -- worth posting.
      The bar: would the reviewer post this to the mailing list?
@@ -495,7 +490,7 @@ After all validation subagents complete:
    Defaults: TYPO -> POST; NITPICK -> FYI.
    Judge all other severities individually against the bar.
 
-Write `postgres/findings/$ARGUMENTS/v{version}/03-review-validated.md`:
+Write `$OUTDIR/03-review-validated.md`:
 
 ```markdown
 # Validated Findings: $ARGUMENTS v{version}
@@ -554,7 +549,7 @@ Write `postgres/findings/$ARGUMENTS/v{version}/03-review-validated.md`:
 [Brief list: title + one-line reason why it was withdrawn]
 ```
 
-Commit: `git add postgres/findings/$ARGUMENTS/ && git commit -m "review($ARGUMENTS): add validated findings"`
+Commit: `git add $OUTDIR/ && git commit -m "review($ARGUMENTS): add validated findings"`
 
 ---
 
@@ -571,7 +566,7 @@ Status categories:
 - **FIXED** -- Was raised on the list and has been addressed in this version or confirmed fixed by the author.
 - **UNDER_DISCUSSION** -- Actively being debated on the list, no resolution yet.
 
-Write `postgres/findings/$ARGUMENTS/v{version}/04-mailing-list-status.md`:
+Write `$OUTDIR/04-mailing-list-status.md`:
 
 ```markdown
 # Mailing List Cross-Reference: $ARGUMENTS v{version}
@@ -623,7 +618,7 @@ discussion. These are the most valuable for mailing list feedback.
 [... repeat ...]
 ```
 
-Commit: `git add postgres/findings/$ARGUMENTS/ && git commit -m "review($ARGUMENTS): add mailing list cross-reference"`
+Commit: `git add $OUTDIR/ && git commit -m "review($ARGUMENTS): add mailing list cross-reference"`
 
 ---
 
@@ -631,7 +626,7 @@ Commit: `git add postgres/findings/$ARGUMENTS/ && git commit -m "review($ARGUMEN
 
 Read all previous phase outputs (00 through 04) and produce the final summary.
 
-Write `postgres/findings/$ARGUMENTS/v{version}/05-summary.md`:
+Write `$OUTDIR/05-summary.md`:
 
 ```markdown
 # Review Summary: $ARGUMENTS v{version}
@@ -710,7 +705,7 @@ Include ONLY findings classified POST. FYI findings must not appear here.]
 - FYI: N
 ```
 
-Write `postgres/findings/$ARGUMENTS/v{version}/findings.json` with counts of the surviving findings in `03-review-validated.md` (Confirmed, Downgraded and Trivial; Withdrawn findings only go to `withdrawn`), by validated severity, and by post-worthiness:
+Write `$OUTDIR/findings.json` with counts of the surviving findings in `03-review-validated.md` (Confirmed, Downgraded and Trivial; Withdrawn findings only go to `withdrawn`), by validated severity, and by post-worthiness:
 
 ```json
 {
@@ -727,7 +722,7 @@ The counts must match the Statistics section above.
 Refresh the committed metadata so the title reflects the overview:
 `../bin/findings-metadata --project postgres/project.yaml $ARGUMENTS`
 
-Commit: `git add postgres/findings/$ARGUMENTS/ && git commit -m "review($ARGUMENTS): add review summary -- review complete"`
+Commit: `git add $OUTDIR/ && git commit -m "review($ARGUMENTS): add review summary -- review complete"`
 
 ---
 
@@ -751,7 +746,7 @@ Content rules:
 - Skip findings that `04-mailing-list-status.md` marks FIXED.
   KNOWN or UNDER_DISCUSSION findings only get a short note, and only if our validation adds something (a reproducer, a confirmation, a disagreement).
 - Write in first person singular ("I"), as the reviewer.
-  Say in one sentence that the issues came from an automated claude review (e.g. "An automated claude review pointed out ..."), but never mention agents, phases, severity labels, POST/FYI, or the findings files.
+  Say in one sentence that the issues came from an automated review (e.g. "An automated review pointed out ..." or "A coding agent assisted review found ..."), but never name the agent or model, and never mention agents, phases, severity labels, POST/FYI, or the findings files.
 - For each bug: what goes wrong, the concrete scenario or reproducer (short SQL / commands, inline, not as an attachment reference), the actual vs expected result, and the suggested fix if we have a confident one.
   Quote the relevant patch hunk (a few lines, as plain diff) when it makes the location clear.
   Do not overstate confidence: a LIKELY_BUG is written as a question or "I think", per the style guide.
@@ -760,7 +755,7 @@ Content rules:
 - Greeting "Hello" (no comma), no sign-off.
 - Keep it short: the reproducer and the mechanism, not a narrative.
 
-Write `postgres/findings/$ARGUMENTS/v{version}/06-reply-draft.md`:
+Write `$OUTDIR/06-reply-draft.md`:
 
 ```
 # Draft reply: $ARGUMENTS v{version}
@@ -773,7 +768,7 @@ Subject: Re: <thread subject>
 <email body>
 ```
 
-Commit: `git add postgres/findings/$ARGUMENTS/ && git commit -m "review($ARGUMENTS): add mailing list reply draft"`
+Commit: `git add $OUTDIR/ && git commit -m "review($ARGUMENTS): add mailing list reply draft"`
 
 ---
 
@@ -785,16 +780,16 @@ After all phases are done, print this summary:
 Review complete for $ARGUMENTS v{version}
 
 Output files:
-  postgres/findings/$ARGUMENTS/v{version}/00-overview.md
-  postgres/findings/$ARGUMENTS/v{version}/01-design-review.md
-  postgres/findings/$ARGUMENTS/v{version}/02-code-review.md
-  postgres/findings/$ARGUMENTS/v{version}/03-review-validated.md
-  postgres/findings/$ARGUMENTS/v{version}/04-mailing-list-status.md
-  postgres/findings/$ARGUMENTS/v{version}/05-summary.md
-  postgres/findings/$ARGUMENTS/v{version}/06-reply-draft.md (only if Phase 7 ran)
-  postgres/findings/$ARGUMENTS/v{version}/tests/
-  postgres/findings/$ARGUMENTS/v{version}/discussion.txt
-  postgres/findings/$ARGUMENTS/v{version}/patches/
+  $OUTDIR/00-overview.md
+  $OUTDIR/01-design-review.md
+  $OUTDIR/02-code-review.md
+  $OUTDIR/03-review-validated.md
+  $OUTDIR/04-mailing-list-status.md
+  $OUTDIR/05-summary.md
+  $OUTDIR/06-reply-draft.md (only if Phase 7 ran)
+  $OUTDIR/tests/
+  $OUTDIR/discussion.txt
+  $OUTDIR/patches/
 
 Start with 05-summary.md for the high-level view, or ask about any specific finding.
 ```

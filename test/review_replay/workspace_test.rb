@@ -98,7 +98,7 @@ class ReplayWorkspaceTest < Minitest::Test
   def test_writes_replay_json
     run = prepare
     data = JSON.parse(File.read(File.join(run.dir, 'replay.json')))
-    assert_equal %w[created_at head project reference route topic version], data.keys.sort
+    assert_equal %w[agent created_at head project reference route topic version], data.keys.sort
     assert_equal ['p', 't1', 2, 'full'], data.values_at('project', 'topic', 'version', 'route')
     assert_equal live('p', 'findings', 't1', 'v2'), data['reference']
     assert_equal run.reference, data['reference']

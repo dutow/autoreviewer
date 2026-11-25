@@ -48,6 +48,8 @@ task login
 ```
 
 Runs `claude /login` inside the container, interactively.
+For projects using codex, also run `task codex-login` (device code login, stored in the same volume).
+Set `review.agent` in a project only after `task build` and `task codex-login`.
 Auth is stored in the `home` docker volume (`/home/reviewer`), so it survives image rebuilds and `task down` / `task up` cycles.
 
 Changing `UID` in `.env` after your first `task build` means the container user's home directory changes ownership expectations; if login stops working after a uid change, remove the `home` volume and log in again.
@@ -175,7 +177,7 @@ A failed phase stops the review, prints `FAILED: <reason>`, and opens a tmux win
 - `state/logs/<project>-<topic>-v<N>/<NN>-<phase>.jsonl` - the raw stream-json output of each phase session, appended on every run.
   Commit reviews log to `state/logs/<project>-commits-<from>-<to>/commits.jsonl`.
   `bin/review-prune` removes log dirs untouched for `REVIEW_PRUNE_DAYS` days (see [Pruning](#pruning-old-builds-and-worktrees)).
-- `state/usage.log` - one JSON line per finished or limit-interrupted phase: time, project, topic, version, route, phase, model, status (`ok`, `failed`, `limit`), cost and tokens.
+- `state/usage.log` - one JSON line per finished or limit-interrupted phase: time, project, topic, version, route, phase, agent, model, status (`ok`, `failed`, `limit`), cost and tokens.
 - `<project>/findings/<topic>/vNN/usage.json` - committed with the findings: route, claude version, per-phase tokens, cost and duration, and totals.
   Runs cut short by the usage limit are in it too, with status `limit`, so the totals are the full cost of the review.
   A re-run that runs no phase leaves `usage.json` as it is, and creates none.
@@ -183,15 +185,31 @@ A failed phase stops the review, prints `FAILED: <reason>`, and opens a tmux win
 
 ### Usage limit pause
 
-When a phase hits the claude usage limit, the runner writes `state/paused` (the reset time plus a two minute margin, and the window that set it), waits, and runs the phase again.
-A run counts as a limit hit when the stream had a `rate_limit_event` with status `rejected` and the run did not end cleanly, or when it ended with an error result reading `You've hit your ... limit`.
+When a phase hits an agent's usage limit, the runner writes that agent's pause file (the reset time plus a two minute margin, and the window that set it), waits, and runs the phase again.
+The files are `state/paused` for claude and `state/paused-codex` for codex.
+A claude run counts as a limit hit when the stream had a `rate_limit_event` with status `rejected` and the run did not end cleanly, or when it ended with an error result reading `You've hit your ... limit`.
 The reset time is the event's `resetsAt`; without one it is parsed from the message (`resets 3pm`, `resets Nov 24, 3pm`, as local time), and when that fails too the runner waits an hour.
+A codex run counts as a limit hit when it failed with an error containing `usage limit` (not a context window one); the reset is parsed from `try again at <time>` or `try again in <N> minutes|hours|days` (any case), and without one the runner waits an hour.
 It always waits at least five minutes.
 It gives up after 5 retries and fails the review.
-While `state/paused` is in the future the queue starts no new review; it prints `paused until ... (usage limit)` once and polls every 30 seconds.
-The runner removes the file after a successful retry.
-The queue removes it once the time has passed, or when it is corrupt.
-To lift a pause by hand, delete `state/paused`.
+A pause is short when the reset is within 12 hours (the 5-hour window), and long when it is further out (the weekly limit).
+The runner removes its file after a successful retry.
+The queue removes a file once the time has passed, or when it is corrupt.
+
+Before starting a topic the queue holds it only when no agent can serve it, by the project's `review.agent`:
+
+| mode | held when |
+|---|---|
+| `claude` | claude paused |
+| `codex` | codex paused |
+| `alternate` | both paused |
+| `both` | either agent short-paused, or both long-paused |
+
+Commit batches always need claude.
+The queue stays in order, so a held topic blocks the ones behind it.
+It prints `holding <entry>: <agent> paused until ... (usage limit)` once per pause and polls every 30 seconds.
+If the project config is invalid the queue does not hold the topic; the runner reports the error.
+To lift a pause by hand, delete `state/paused` or `state/paused-codex`.
 
 ### Resume
 
@@ -224,12 +242,12 @@ It is how a route is checked before a project switches to it: replay a few revie
 Replaying some of the same topics on `single` again shows how much two runs differ on their own.
 
 ```
-task replay -- <project> <topic> <vN> <route>    # tmux window "replay", watch with task attach
+task replay -- [--agent NAME] <project> <topic> <vN> <route>    # tmux window "replay", watch with task attach
 task compare -- <run dir> <reference dir>         # one Opus session, a few minutes
 task compare -- --table                           # one line per compare
 ```
 
-Inside the container the same commands are `bin/review-replay [--keep-worktree] <project> <topic> <vN> <route>` and `bin/review-compare`, run from the repo root.
+Inside the container the same commands are `bin/review-replay [--keep-worktree] [--agent NAME] <project> <topic> <vN> <route>` and `bin/review-compare`, run from the repo root.
 `review-replay` prints the run dir and the `review-compare` command line for it when it ends.
 
 A replay needs the live `review/<topic>` still at vN (`metadata.json` version N), and reuses that ingest and build.
@@ -243,10 +261,11 @@ Each run gets `replay/<project>/<topic>/vN-<route>-<n>/`:
   Phase commits land in this clone only.
 - `findings` - link to the replayed findings dir in `ws/`.
 - `state/` - the runner's state dir (logs, `usage.log`, pause file), separate from the queue's.
-- `replay.json` - project, topic, version, route, reference dir, review HEAD, start and end time, `ok`, `inputs_changed`, `cost_usd`.
+- `replay.json` - project, topic, version, route, forced agent, reference dir, review HEAD, start and end time, `ok`, `inputs_changed`, `cost_usd`.
 - `compare-<label>.md` and `.json` - written by `review-compare`; `<label>` is `reference` for the original review, or the other run's dir name when comparing two replays.
 
 The reference `discussion.txt` is copied into the replay findings dir before the run, and `review-run --replay` tells each phase to use it instead of fetching the thread again, so the replay sees the thread as the original review did.
+With `both`, the runner also copies it into the discovery subdir before discovery.
 
 `review-compare` matches the POST and POST-MINOR points of the replay against the reference: matched, only in the reference, only in the replay, with a one-line reason each.
 It adds both sides' usage totals to the json.

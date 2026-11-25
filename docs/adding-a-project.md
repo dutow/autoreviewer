@@ -21,11 +21,75 @@ review:
   command: <name>:review-patch # slash command, see .claude/commands/<name>/
   phases: <name>               # phase dir under .claude/review-phases/ (see Review phases)
   route: single                # route in its phases.yaml: single (default in the examples) or full
+  agent: claude                # optional; claude (default), codex, alternate or both (see Review agent)
+  primary: claude              # optional; both only: the agent that validates and summarizes
+  claude:                      # optional; overrides the phases.yaml model/effort of every phase
+    model: opus
+    effort: high
+  codex:                       # optional; defaults shown
+    model: gpt-6.2-astra
+    effort: xhigh
 ```
 
 `review.phases` is required for the headless runner.
 A project without it is still launched as an interactive claude session running `review.command`, with a warning in the queue log.
 `review.route` defaults to `full` when unset.
+
+### Review agent
+
+`review.agent` picks the agent that runs the review sessions.
+Without it every review runs on claude, as before.
+
+- `claude` - every phase runs as `claude -p`.
+- `codex` - every phase runs as `codex exec`.
+- `alternate` - each review runs on one of the two, taking turns between versions.
+- `both` - both agents on one review, `primary` (default `claude`) validates and summarizes; needs `route: single`, any other route fails the review.
+
+The phases.yaml models are claude names.
+`review.claude.model` and `effort` override them for every phase; codex ignores them and uses `review.codex.model` and `effort` (default `gpt-6.2-astra`, `xhigh`).
+
+`alternate` picks the agent of a review:
+
+1. A review already started keeps its agent; else the agent that did not review the previous version (claude when its `usage.json` names none); else the topic number's parity (even claude, odd codex; a topic without digits uses the parity of a stable hash of its name).
+2. If that agent is paused by a usage limit and the other is not, the other one runs.
+3. A usage limit during the review hands the rest of it to the other agent at once; with both paused the runner waits for the earlier reset and goes on with that agent.
+
+`both` runs the route's one phase twice; a route with more phases fails the review:
+
+1. `discovery` on the secondary, the agent that is not `primary`.
+   The prompt is the single prompt with `$OUTDIR` and the header's output directory set to `<outdir>/<secondary>/`, plus a header note to stop after the overview, design review and code review.
+   The runner commits that subdir after the session.
+2. The route's phase (`review`) on the primary, with a header note: add the discovery's code findings missing from its own code review as candidates before validation, and weigh its design concerns in the summary.
+   The note is left out when discovery was skipped or wrote no `<secondary>/02-code-review.md`.
+
+`both` needs a review prompt that writes every output under `$OUTDIR`, as the example commands do; an older prompt that hardcodes `findings/<topic>/vNN/` paths writes outside the subdir during discovery and fails the check below.
+
+However discovery ends (done, failed, or skipped on a long limit), the runner checks the version dir: a change outside `<secondary>/` (committed since the first discovery try started, staged or untracked) fails the review, naming the files.
+`metadata.json`, `usage.json` and the paths already uncommitted when the first try started are exempt, and nothing is reverted.
+The commit before the first try stays in `usage.json` as `discovery_base` until discovery is done, with those paths as `discovery_dirty`, so a resumed discovery still catches what an earlier try wrote; remove or revert those files and commit before rerunning.
+A resumed review does not rerun a finished or skipped discovery, and a review whose route phase is already done runs no discovery (unless an earlier discovery try is pending, so its check still runs).
+`--agent` (below) runs a plain one-agent review, with no discovery.
+
+A usage limit is short when its reset is within 12 hours, long when it is further out:
+
+| mode | short limit | long limit |
+|---|---|---|
+| `claude` / `codex` | wait for the reset and retry | same, plus a tmux notice window naming the agent and the reset time |
+| `alternate` | the other agent takes over | the other agent takes over |
+| `both` | wait for the reset (keep both models) | degrade to one agent, below |
+
+`both` on a long limit:
+
+- secondary long-limited, before or during discovery: discovery is skipped, the primary reviews alone with no discovery note; what a cut-short discovery wrote in the subdir is committed as the record.
+- primary long-limited: the other agent runs the review phase alone, with no discovery note; its discovery output stays in the subdir.
+- both long-limited: the runner waits for the earlier reset and goes on with that agent.
+
+A degraded review has `"degraded": true` in `usage.json`, a skipped discovery a `skipped` entry.
+
+`claude` and `codex` never switch: a limit waits for the reset, and one more than 12 hours away also opens a tmux window `LIMIT-<agent>`.
+`bin/review-run --agent claude|codex` forces one agent for a run, whatever the mode, with no switching; a `both` project then takes any route.
+codex needs its CLI installed and logged in (see [setup.md](setup.md)); set `review.agent` only after that.
+An `OPENAI_API_KEY` or `CODEX_API_KEY` in the environment gets a warning, like `ANTHROPIC_API_KEY`: codex may bill it.
 
 ## Hook resolution
 
@@ -85,6 +149,7 @@ Phase sessions run without it, so one finished phase never closes the window.
 Phase sessions have `REVIEW_RUN=1` instead; a hook that should act in every review session, like the `PermissionRequest` auto-allow, checks `[ -n "$REVIEW_DONE_FILE$REVIEW_RUN" ]`.
 
 A usage-limit hit does not end the review: the runner waits for the reset and retries (see [setup.md](setup.md#usage-limit-pause)).
+With `review.agent: alternate` the other agent takes over instead, and with `both` a long limit leaves the review to one agent (see [Review agent](#review-agent)).
 
 ## Review phases
 
@@ -94,7 +159,7 @@ The runner reads the phase definitions from `workspace/.claude/review-phases/<na
 - `shared.md` - text prepended to the prompt of every phase with `shared: true` (review context for the project).
 - numbered phase files, `01-overview.md` ... - one prompt per phase.
 
-Each phase runs as its own headless `claude -p` session.
+Each phase runs as its own headless agent session, `claude -p` or `codex exec` (see [Review agent](#review-agent)).
 The prompt is a header (project, topic, version, phase, output directory, review worktree, previous reviewed version) followed by `shared.md` (if the phase asks for it) and the phase file.
 Phase files may start with frontmatter, which is dropped.
 `$ARGUMENTS` (the topic), `$OUTDIR` (the findings dir) and `$PROJECT` are replaced in the text.
@@ -127,7 +192,7 @@ routes:
 ```
 
 Phase keys: `name` and `prompt` (required, `name` unique within a route), `output`, `model`, `effort`, `shared`, `skip_if` (`file` in the findings dir plus a `match` regexp).
-A missing prompt file, a duplicate phase name or an unknown route fails the run before claude starts.
+A missing prompt file, a duplicate phase name or an unknown route fails the run before any session starts.
 
 After a phase ends, `output` must exist in the findings dir, or the phase fails.
 The runner commits it if the phase did not.

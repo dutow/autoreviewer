@@ -83,6 +83,11 @@ tasks:
     interactive: true
     cmds: ['{{.COMPOSE}} run --rm --no-deps review-queue claude /login']
 
+  codex-login:
+    desc: First-time codex login inside the container (device code; auth persists in the home volume)
+    interactive: true
+    cmds: ['{{.COMPOSE}} run --rm --no-deps review-queue codex login --device-auth']
+
   ssh-setup:
     desc: Generate a deploy key in the container home; register the printed pubkey with your forge
     cmds:
@@ -130,7 +135,7 @@ tasks:
     cmds: ['{{.COMPOSE}} run --rm --no-deps review-queue bin/review-prune {{.CLI_ARGS}}']
 
   replay:
-    desc: 'Replay a past review in tmux: task replay -- <project> <topic> <vN> <route>'
+    desc: 'Replay a past review in tmux: task replay -- [--agent NAME] <project> <topic> <vN> <route>'
     dotenv: ['.env']
     cmds:
       - '{{.COMPOSE}} exec -w "$REPO_ROOT" review-queue tmux new-window -d -t reviews: -n replay "bin/review-replay {{.CLI_ARGS}}; echo; echo ''Press Enter to close...''; read"'

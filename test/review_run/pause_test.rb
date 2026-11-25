@@ -50,6 +50,37 @@ class PauseTest < Minitest::Test
     end
   end
 
+  def test_for_paths
+    assert_equal File.join(@dir, 'paused'), ReviewRun::Pause.for(@dir, 'claude').path
+    assert_equal File.join(@dir, 'paused-codex'), ReviewRun::Pause.for(@dir, 'codex').path
+  end
+
+  def test_long_threshold
+    p = ReviewRun::Pause.for(@dir, 'codex')
+    p.set(@now + 12 * 3600, by: 'w')
+    refute p.long?(@now)
+    assert_equal :short, p.state(@now)
+    p.set(@now + 12 * 3600 + 1, by: 'w')
+    assert p.long?(@now)
+    assert_equal :long, p.state(@now)
+  end
+
+  def test_state_none_when_missing_or_expired
+    p = ReviewRun::Pause.for(@dir, 'claude')
+    assert_equal :none, p.state(@now)
+    p.set(@now - 1, by: 'w')
+    assert_equal :none, p.state(@now)
+    refute File.exist?(p.path)
+  end
+
+  def test_state_corrupt_file_none_and_removed
+    FileUtils.mkdir_p(File.dirname(@path))
+    File.write(@path, 'not json')
+    assert_equal :none, @pause.state(@now)
+    refute @pause.long?(@now)
+    refute File.exist?(@path)
+  end
+
   def test_clear
     @pause.set(@now + 60, by: 'p-t1')
     @pause.clear

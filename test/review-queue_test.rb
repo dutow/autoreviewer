@@ -11,12 +11,16 @@ class ReviewQueuePauseTest < Minitest::Test
     @saved_env = ENV_KEYS.to_h { |k| [k, ENV[k]] }
     ENV_KEYS.each { |k| ENV.delete(k) }
     @dir = Dir.mktmpdir
-    ENV['STATE_DIR'] = File.join(@dir, 'state')
-    ENV['WORKSPACE_DIR'] = File.join(@dir, 'ws')
-    @path = File.join(@dir, 'state', 'paused')
-    @pause = ReviewRun::Pause.new(@path)
+    @state = File.join(@dir, 'state')
+    @ws = File.join(@dir, 'ws')
+    ENV['STATE_DIR'] = @state
+    ENV['WORKSPACE_DIR'] = @ws
+    @claude = ReviewRun::Pause.for(@state, 'claude')
+    @codex = ReviewRun::Pause.for(@state, 'codex')
     @queue = ReviewQueue.new
     @now = Time.at(1_800_000_000)
+    @short = @now + 600
+    @long = @now + 13 * 3600
   end
 
   def teardown
@@ -24,47 +28,211 @@ class ReviewQueuePauseTest < Minitest::Test
     @saved_env.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
   end
 
-  def until_line(t)
-    /\A\[\d\d:\d\d:\d\d\] paused until #{Regexp.escape(t.strftime('%Y-%m-%d %H:%M:%S'))} \(usage limit\)\n\z/
+  def project(name, review)
+    FileUtils.mkdir_p(File.join(@ws, name))
+    File.write(File.join(@ws, name, 'project.yaml'), "review:\n#{review}")
   end
 
-  def test_not_paused_without_file
-    out, = capture_io { refute @queue.paused_now?(@now) }
+  def held(line, at = @now)
+    out, = capture_io { @result = @queue.held?(line, at) }
+    [@result, out]
+  end
+
+  def hold_line(line, agent, t)
+    /\A\[\d\d:\d\d:\d\d\] holding #{Regexp.escape(line)}: #{agent} paused until #{Regexp.escape(t.strftime('%Y-%m-%d %H:%M:%S'))} \(usage limit\)\n\z/
+  end
+
+  def test_not_held_without_pause
+    project('p', "  command: rev\n")
+    res, out = held('p t1')
+    refute res
     assert_empty out
   end
 
-  def test_paused_prints_once_per_pause
-    @pause.set(@now + 600, by: 'p-t1')
+  def test_claude_project_held_by_claude_pause_only
+    project('p', "  command: rev\n")
+    @codex.set(@short, by: 'x')
+    refute held('p t1').first
+    @claude.set(@short, by: 'x')
+    res, out = held('p t1')
+    assert res
+    assert_match hold_line('p t1', 'claude', @short), out
+  end
+
+  def test_codex_project_held_by_codex_pause_only
+    project('p', "  agent: codex\n")
+    @claude.set(@short, by: 'x')
+    refute held('p t1').first
+    @codex.set(@short, by: 'x')
+    res, out = held('p t1')
+    assert res
+    assert_match hold_line('p t1', 'codex', @short), out
+  end
+
+  def test_alternate_held_only_when_both_paused
+    project('p', "  agent: alternate\n")
+    @claude.set(@short, by: 'x')
+    refute held('p t1').first
+    @codex.set(@long, by: 'x')
+    assert held('p t1').first
+  end
+
+  def test_both_held_by_short_not_by_single_long
+    project('p', "  agent: both\n  route: single\n")
+    @codex.set(@long, by: 'x')
+    refute held('p t1').first
+    @codex.set(@short, by: 'x')
+    assert held('p t1').first
+  end
+
+  def test_both_held_by_two_long
+    project('p', "  agent: both\n  route: single\n")
+    @claude.set(@long, by: 'x')
+    @codex.set(@long, by: 'x')
+    assert held('p t1').first
+  end
+
+  def test_commit_batch_held_by_claude_pause
+    project('p', "  agent: codex\n")
+    @codex.set(@short, by: 'x')
+    refute held('p commits a..b').first
+    @claude.set(@short, by: 'x')
+    assert held('p commits a..b').first
+  end
+
+  def test_prints_once_per_pause
+    project('p', "  command: rev\n")
+    @claude.set(@short, by: 'x')
     out, = capture_io do
-      assert @queue.paused_now?(@now)
-      assert @queue.paused_now?(@now + 30)
-      assert @queue.paused_now?(@now + 60)
+      assert @queue.held?('p t1', @now)
+      assert @queue.held?('p t1', @now + 30)
     end
-    assert_match until_line(@now + 600), out
+    assert_match hold_line('p t1', 'claude', @short), out
 
-    @pause.set(@now + 1200, by: 'p-t2')
-    out, = capture_io { assert @queue.paused_now?(@now + 90) }
-    assert_match until_line(@now + 1200), out
+    @claude.set(@now + 1200, by: 'y')
+    out, = capture_io { assert @queue.held?('p t1', @now + 90) }
+    assert_match hold_line('p t1', 'claude', @now + 1200), out
   end
 
-  def test_expired_pause_removed_and_next_pause_printed
-    @pause.set(@now + 600, by: 'p-t1')
-    capture_io { assert @queue.paused_now?(@now) }
-    out, = capture_io { refute @queue.paused_now?(@now + 600) }
+  def test_expired_pause_removed_and_reprinted_for_next
+    project('p', "  command: rev\n")
+    @claude.set(@short, by: 'x')
+    capture_io { assert @queue.held?('p t1', @now) }
+    out, = capture_io { refute @queue.held?('p t1', @short) }
     assert_empty out
-    refute File.exist?(@path)
+    refute File.exist?(@claude.path)
 
-    @pause.set(@now + 600, by: 'p-t1')
-    out, = capture_io { assert @queue.paused_now?(@now + 10) }
-    assert_match until_line(@now + 600), out
+    @claude.set(@short, by: 'x')
+    out, = capture_io { assert @queue.held?('p t1', @now + 10) }
+    assert_match hold_line('p t1', 'claude', @short), out
   end
 
   def test_corrupt_pause_file_ignored
-    FileUtils.mkdir_p(File.dirname(@path))
-    File.write(@path, '{')
-    out, = capture_io { refute @queue.paused_now?(@now) }
+    project('p', "  command: rev\n")
+    FileUtils.mkdir_p(@state)
+    File.write(@claude.path, '{')
+    res, out = held('p t1')
+    refute res
     assert_empty out
-    refute File.exist?(@path)
+    refute File.exist?(@claude.path)
+  end
+
+  def test_unknown_project_not_held
+    @claude.set(@short, by: 'x')
+    res, out = held('nope t1')
+    refute res
+    assert_empty out
+  end
+
+  def test_bad_config_not_held
+    project('p', "  agent: bogus\n")
+    @claude.set(@short, by: 'x')
+    @codex.set(@short, by: 'x')
+    refute held('p t1').first
+  end
+end
+
+class ReviewQueuePreflightTest < Minitest::Test
+  ENV_KEYS = %w[STATE_DIR WORKSPACE_DIR CODEX_HOME OPENAI_API_KEY CODEX_API_KEY PATH].freeze
+
+  def setup
+    @saved_env = ENV_KEYS.to_h { |k| [k, ENV[k]] }
+    ENV_KEYS.each { |k| ENV.delete(k) unless k == 'PATH' }
+    @dir = Dir.mktmpdir
+    @ws = File.join(@dir, 'ws')
+    ENV['STATE_DIR'] = File.join(@dir, 'state')
+    ENV['WORKSPACE_DIR'] = @ws
+    ENV['CODEX_HOME'] = File.join(@dir, 'codex-home')
+    FileUtils.mkdir_p(File.join(@ws, '.git'))
+    @queue = ReviewQueue.new
+  end
+
+  def teardown
+    FileUtils.rm_rf(@dir)
+    @saved_env.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
+  end
+
+  def project(name, yaml)
+    FileUtils.mkdir_p(File.join(@ws, name))
+    File.write(File.join(@ws, name, 'project.yaml'), yaml)
+  end
+
+  def run_preflight
+    out, = capture_io { @result = @queue.send(:preflight) }
+    out
+  end
+
+  def test_codex_project_without_auth_fails
+    project('p', "review:\n  agent: codex\n")
+    out = run_preflight
+    refute @result
+    assert_includes out, "FAIL codex authenticated: codex CLI missing or not logged in - run 'task codex-login'"
+  end
+
+  def with_fake_codex
+    bin = File.join(@dir, 'bin')
+    FileUtils.mkdir_p(bin)
+    File.write(File.join(bin, 'codex'), "#!/bin/sh\nexit 0\n")
+    File.chmod(0o755, File.join(bin, 'codex'))
+    ENV['PATH'] = "#{bin}:#{ENV['PATH']}"
+  end
+
+  def test_codex_auth_file_passes
+    project('p', "review:\n  agent: codex\n")
+    with_fake_codex
+    FileUtils.mkdir_p(ENV['CODEX_HOME'])
+    File.write(File.join(ENV['CODEX_HOME'], 'auth.json'), '{}')
+    assert_match(/^OK   codex authenticated$/, run_preflight)
+  end
+
+  %w[OPENAI_API_KEY CODEX_API_KEY].each do |key|
+    define_method("test_codex_#{key.downcase}_passes") do
+      project('p', "review:\n  agent: codex\n")
+      with_fake_codex
+      ENV[key] = 'k'
+      assert_match(/^OK   codex authenticated$/, run_preflight)
+    end
+  end
+
+  def test_codex_installed_without_auth_fails
+    project('p', "review:\n  agent: codex\n")
+    with_fake_codex
+    assert_match(/^FAIL codex authenticated: /, run_preflight)
+  end
+
+  def test_all_claude_has_no_codex_check
+    project('p', "review:\n  command: rev\n")
+    project('_template', "review:\n  agent: codex\n")
+    refute_includes run_preflight, 'codex authenticated'
+  end
+
+  def test_invalid_agent_has_no_codex_check
+    project('p', "review:\n  agent: gemini\n")
+    refute_includes run_preflight, 'codex authenticated'
+    %w[codex both alternate].each do |mode|
+      project('p', "review:\n  agent: #{mode}\n")
+      assert_includes run_preflight, 'codex authenticated', mode
+    end
   end
 end
 

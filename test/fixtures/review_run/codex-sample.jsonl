@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a20e84-deac-7b82-9dcf-f015eed6b591"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I'll write `ok` to `b.txt`."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/usr/bin/zsh -lc \"printf '%s' ok > b.txt\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/usr/bin/zsh -lc \"printf '%s' ok > b.txt\"","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"done"}}
+{"type":"turn.completed","usage":{"input_tokens":32723,"cached_input_tokens":16256,"cache_write_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0}}

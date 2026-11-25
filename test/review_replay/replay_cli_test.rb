@@ -11,6 +11,7 @@ class ReplayCliTest < Minitest::Test
   ROOT = File.expand_path('../..', __dir__)
   CLI = File.join(ROOT, 'bin', 'review-replay')
   FAKE = File.join(ROOT, 'test', 'fixtures', 'review_run', 'fake-claude')
+  FAKE_CODEX = File.join(ROOT, 'test', 'fixtures', 'review_run', 'fake-codex')
 
   def setup
     @root = File.realpath(Dir.mktmpdir)
@@ -30,7 +31,7 @@ class ReplayCliTest < Minitest::Test
 
   def env
     { 'WORKSPACE_DIR' => @live, 'REPLAY_DIR' => File.join(@root, 'replay'), 'STATE_DIR' => File.join(@root, 'state'),
-      'CLAUDE_BIN' => FAKE, 'FAKE_CLAUDE_PLAN' => @plan, 'FAKE_CLAUDE_CALLS' => @calls_file,
+      'CLAUDE_BIN' => FAKE, 'CODEX_BIN' => FAKE_CODEX, 'FAKE_CLAUDE_PLAN' => @plan, 'FAKE_CLAUDE_CALLS' => @calls_file,
       'TMUX' => nil, 'ANTHROPIC_API_KEY' => nil, 'REVIEW_DONE_FILE' => nil }
   end
 
@@ -110,6 +111,25 @@ class ReplayCliTest < Minitest::Test
     assert_equal false, replay_json['ok']
     refute_includes worktrees, run_dir('ws', 'p', 'review', 't1')
     refute Dir.exist?(run_dir('ws', 'p', 'review', 't1'))
+  end
+
+  def test_agent_passed_through
+    out, st = replay('--agent', 'codex', 'p', 't1', 'v2', 'full')
+    assert st.success?, out
+    assert_equal %w[codex codex], calls.map { |c| c['agent'] }
+    assert_equal 'codex', replay_json['agent']
+  end
+
+  def test_agent_nil_when_not_forced
+    out, st = replay
+    assert st.success?, out
+    assert_nil replay_json['agent']
+  end
+
+  def test_unknown_agent_is_usage_error
+    out, st = replay('--agent', 'gemini', 'p', 't1', 'v2', 'full')
+    assert_equal 1, st.exitstatus, out
+    refute Dir.exist?(File.join(@root, 'replay'))
   end
 
   def test_keep_worktree

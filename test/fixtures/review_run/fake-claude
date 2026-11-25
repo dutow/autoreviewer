@@ -2,11 +2,14 @@
 # frozen_string_literal: true
 
 # Test double for `claude -p --output-format stream-json`.
-# Plan (FAKE_CLAUDE_PLAN, JSON): {"<phase>": {"write": [..], "files": {"<path>": "<body>"}, "commit": true, "exit": 0,
-#   "no_result": false, "limit_first": false, "limit_times": 0, "limit_text": "...",
-#   "limit_event": {rate_limit_info}, "rate_limit": {rate_limit_info}, "noise": false, "text": "..."}}
+# Plan (FAKE_CLAUDE_PLAN, JSON): {"<phase>": {"write": [..], "files": {"<path>": "<body>"}, "commit": true,
+#   "commit_files": false, "exit": 0, "no_result": false, "limit_first": false, "limit_times": 0,
+#   "limit_agent": null, "limit_text": "...", "limit_event": {rate_limit_info}, "rate_limit": {rate_limit_info},
+#   "noise": false, "text": "..."}}
+# commit_files: also commit the files entries.
 # limit_first / limit_times: the first 1 / N calls for the phase hit the usage limit: error result
 #   with limit_text, preceded by a rate_limit_event carrying limit_event when given.
+# limit_agent: only that agent hits the limit.
 # rate_limit: rate_limit_event emitted on calls that do not hit the limit.
 
 require 'json'
@@ -35,9 +38,11 @@ calls_file = ENV['FAKE_CLAUDE_CALLS']
 prior = calls_file && File.exist?(calls_file) ? File.readlines(calls_file).map { |l| JSON.parse(l) } : []
 if calls_file
   File.open(calls_file, 'a') do |f|
-    f.puts(JSON.generate('phase' => phase, 'argv' => ARGV, 'done_file_env' => ENV.key?('REVIEW_DONE_FILE'),
+    f.puts(JSON.generate('agent' => 'claude', 'phase' => phase, 'argv' => ARGV, 'done_file_env' => ENV.key?('REVIEW_DONE_FILE'),
                          'env' => ENV.slice(*ENV_SEEN), 'cwd' => Dir.pwd, 'outdir' => outdir,
-                         'replay_note' => prompt.include?('Replay of a past review:')))
+                         'replay_note' => prompt.include?('Replay of a past review:'),
+                         'note' => prompt.include?('independent discovery pass'),
+                         'discovery_note' => prompt.include?('Discovery pass:')))
   end
 end
 
@@ -51,6 +56,7 @@ def rate_limit_event(info, session)
 end
 
 limit_times = step['limit_times'] || (step['limit_first'] ? 1 : 0)
+limit_times = 0 if step['limit_agent'] && step['limit_agent'] != 'claude'
 if prior.count { |c| c['phase'] == phase } < limit_times
   rate_limit_event(step['limit_event'], session) if step['limit_event']
   puts JSON.generate('type' => 'result', 'subtype' => 'success', 'is_error' => true,
@@ -61,10 +67,15 @@ if prior.count { |c| c['phase'] == phase } < limit_times
 end
 rate_limit_event(step['rate_limit'], session) if step['rate_limit']
 
-(step['files'] || {}).each do |path, body|
+extra = (step['files'] || {}).map do |path, body|
   path = File.expand_path(path)
   FileUtils.mkdir_p(File.dirname(path))
   File.write(path, body)
+  path
+end
+if step['commit_files'] && !extra.empty?
+  system('git', 'add', '--', *extra, out: File::NULL, err: File::NULL) &&
+    system('git', 'commit', '-q', '-m', "fake #{phase} files", '--', *extra, out: File::NULL, err: File::NULL)
 end
 
 files = step['write'].map { |name| File.join(outdir.to_s, name) }
